@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local configuration
+.env
+*.local.yaml
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Assistant tooling files
+CLAUDE.md
+AGENTS.md
+.claude/

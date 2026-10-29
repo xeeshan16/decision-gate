@@ -1,0 +1,22 @@
+# Example question catalog. Each question is identified by id and version; bump the
+# version whenever the prompt or the options change, because calibration is per version.
+questions:
+  - id: refund.eligible
+    kind: predicate
+    prompt: >-
+      Is this refund request eligible under the 30-day returns policy?
+      Answer true or false.
+    description: Synthetic refund-eligibility check used by the demo.
+
+  - id: ticket.queue
+    kind: choice
+    prompt: Which support queue should handle this ticket?
+    options: [billing, technical, account, shipping, other]
+    description: Synthetic ticket-triage question used by the demo.
+
+  - id: ticket.handling_minutes
+    kind: score
+    prompt: Estimate how many minutes an agent will need to resolve this ticket.
+    min_value: 0
+    max_value: 240
+    tolerance: 15
