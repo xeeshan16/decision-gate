@@ -74,3 +74,25 @@ def answer_key(answer: Answer) -> str:
     if isinstance(answer, bool):
         return "true" if answer else "false"
     return str(answer)
+
+
+class BackendError(RuntimeError):
+    """The backend failed, timed out or returned something that is not a valid decision."""
+
+
+def spread_distribution(
+    question: AnyQuestion, answer: Answer, confidence: float
+) -> dict[str, float] | None:
+    """A full distribution that puts ``confidence`` on ``answer`` and spreads the rest evenly.
+
+    Used when a backend reports only the probability of its own answer. Score questions
+    have no finite label set, so they get ``None``.
+    """
+    if isinstance(question, PredicateQuestion):
+        p_true = confidence if answer is True else 1.0 - confidence
+        return {"true": p_true, "false": 1.0 - p_true}
+    if isinstance(question, ChoiceQuestion):
+        rest = (1.0 - confidence) / (len(question.options) - 1)
+        chosen = answer_key(answer)
+        return {o: (confidence if o == chosen else rest) for o in question.options}
+    return None

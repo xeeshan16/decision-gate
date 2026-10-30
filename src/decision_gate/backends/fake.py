@@ -27,8 +27,8 @@ from decision_gate.backends.base import (
     AnyQuestion,
     DecisionInput,
     RawDecision,
-    answer_key,
     clip_probability,
+    spread_distribution,
 )
 from decision_gate.questions import Answer, ChoiceQuestion, PredicateQuestion, ScoreQuestion
 
@@ -122,7 +122,7 @@ class FakeBackend:
         return RawDecision(
             answer=answer,
             confidence=reported,
-            probabilities=self._distribution(question, answer, reported),
+            probabilities=spread_distribution(question, answer, reported),
             backend=self.name,
             model_version=self._model_version,
         )
@@ -155,16 +155,3 @@ class FakeBackend:
         # Range too narrow to miss on either side by that much: use the far end.
         lo_gap, hi_gap = truth - question.min_value, question.max_value - truth
         return question.min_value if lo_gap > hi_gap else question.max_value
-
-    @staticmethod
-    def _distribution(
-        question: AnyQuestion, answer: Answer, confidence: float
-    ) -> dict[str, float] | None:
-        if isinstance(question, PredicateQuestion):
-            p_true = confidence if answer is True else 1.0 - confidence
-            return {"true": p_true, "false": 1.0 - p_true}
-        if isinstance(question, ChoiceQuestion):
-            rest = (1.0 - confidence) / (len(question.options) - 1)
-            chosen = answer_key(answer)
-            return {o: (confidence if o == chosen else rest) for o in question.options}
-        return None

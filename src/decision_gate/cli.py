@@ -20,6 +20,8 @@ app = typer.Typer(
 )
 questions_app = typer.Typer(help="Inspect and validate question catalogs.", no_args_is_help=True)
 app.add_typer(questions_app, name="questions")
+db_app = typer.Typer(help="Manage the database schema (Alembic migrations).", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -45,6 +47,48 @@ def serve(
 
     settings = Settings()
     uvicorn.run(create_app(settings), host=host, port=port, log_level=settings.log_level)
+
+
+DatabaseURL = Annotated[
+    str | None,
+    typer.Option("--url", help="Database URL. Defaults to DGATE_DATABASE_URL."),
+]
+
+
+def _database_url(url: str | None) -> str:
+    from decision_gate.config import Settings
+
+    return url or Settings().database_url
+
+
+@db_app.command("upgrade")
+def db_upgrade(
+    revision: Annotated[str, typer.Argument(help="Target revision.")] = "head",
+    url: DatabaseURL = None,
+) -> None:
+    """Apply migrations up to a revision (default: the latest)."""
+    from decision_gate.db import migrate
+
+    migrate.upgrade(_database_url(url), revision)
+
+
+@db_app.command("downgrade")
+def db_downgrade(
+    revision: Annotated[str, typer.Argument(help="Target revision, e.g. 'base'.")],
+    url: DatabaseURL = None,
+) -> None:
+    """Revert migrations down to a revision."""
+    from decision_gate.db import migrate
+
+    migrate.downgrade(_database_url(url), revision)
+
+
+@db_app.command("current")
+def db_current(url: DatabaseURL = None) -> None:
+    """Show the revision the database is at."""
+    from decision_gate.db import migrate
+
+    migrate.current(_database_url(url))
 
 
 @questions_app.command("check")

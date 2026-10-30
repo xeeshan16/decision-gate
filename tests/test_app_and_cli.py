@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -19,8 +20,9 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def client(example_catalog: QuestionCatalog) -> TestClient:
-    return TestClient(create_app(Settings(), catalog=example_catalog))
+def client(example_catalog: QuestionCatalog, sqlite_url: str) -> Iterator[TestClient]:
+    with TestClient(create_app(Settings(database_url=sqlite_url), catalog=example_catalog)) as c:
+        yield c
 
 
 def test_healthz(client: TestClient) -> None:
@@ -29,7 +31,21 @@ def test_healthz(client: TestClient) -> None:
 
 def test_readyz(client: TestClient) -> None:
     body = client.get("/readyz").json()
-    assert body == {"status": "ready", "version": __version__, "backend": "fake", "questions": 3}
+    assert body == {
+        "status": "ready",
+        "version": __version__,
+        "backend": "fake",
+        "questions": 3,
+        "database": "ok",
+    }
+
+
+def test_readyz_reports_unavailable_database(tmp_path: Path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path}/missing-dir/dgate.db"
+    with TestClient(create_app(Settings(database_url=url))) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["database"] == "unavailable"
 
 
 def test_list_and_get_questions(client: TestClient) -> None:
@@ -47,9 +63,17 @@ def test_unknown_question_is_404(client: TestClient) -> None:
     assert client.get("/v1/questions/ticket.queue?version=9").status_code == 404
 
 
-def test_app_loads_catalog_from_settings() -> None:
-    app = create_app(Settings(questions_file=EXAMPLES / "questions.yaml"))
+def test_app_loads_catalog_from_settings(sqlite_url: str) -> None:
+    app = create_app(Settings(questions_file=EXAMPLES / "questions.yaml", database_url=sqlite_url))
     assert TestClient(app).get("/readyz").json()["questions"] == 3
+
+
+def test_shutdown_closes_backend_client(sqlite_url: str) -> None:
+    settings = Settings(database_url=sqlite_url, backend="http", http_url="http://decider")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/readyz").json()["backend"] == "http"
+    assert app.state.backend._client.is_closed
 
 
 def test_app_without_catalog_is_empty() -> None:
