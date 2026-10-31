@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 2 of a 14-day build). See
+> **Status:** under active development (day 3 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -40,7 +40,8 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Health, readiness and question catalog API; `dgate` CLI | ✅ day 1 |
 | Backend adapters: fake, generic HTTP decision API, OpenAI-compatible LLM returning JSON | ✅ day 2 |
 | `POST /v1/decide` with idempotency keys, PostgreSQL persistence and Alembic migrations | ✅ day 2 |
-| Outcome ingestion over HTTP or Kafka | planned (day 3) |
+| Idempotent outcomes over HTTP (single and batch), label coverage and raw accuracy stats | ✅ day 3 |
+| Streaming outcome ingestion: JSON Lines CLI and an optional Kafka consumer with a dead-letter topic | ✅ day 3 |
 | ECE, Brier, log loss and reliability bins | planned (day 4) |
 | Platt, isotonic and temperature calibrators | planned (day 5) |
 | Thresholds with Wilson/Clopper-Pearson bounds, conformal sets | planned (day 6) |
@@ -143,7 +144,67 @@ $ curl -s -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
  "idempotency_key":"order-1042","created_at":"2026-10-30T09:58:06.815632Z"}
 ```
 
-(Output wrapped for readability.) `GET /v1/decisions/{id}` returns a stored decision.
+(Output wrapped for readability.) `GET /v1/decisions/{id}` returns a stored decision,
+including its outcome once one is recorded.
+
+### Outcomes
+
+The ground truth usually arrives later, from another system. Record it once per decision;
+decision-gate scores it with the question's own rule (`correct`). Sending the same outcome
+again is a harmless `200`; sending a *different* one is a `409`, because silently
+rewriting a label would rewrite the history calibration is fitted on:
+
+```console
+$ curl -s -X POST localhost:8080/v1/outcomes -H 'content-type: application/json' \
+    -d '{"decision_id": "ad9d1aff-f579-47b8-9b1b-0baf3497505d", "outcome": false, "source": "refund-desk"}'
+{"decision_id":"ad9d1aff-f579-47b8-9b1b-0baf3497505d","outcome":false,"correct":false,
+ "source":"refund-desk","observed_at":"2026-10-31T10:00:51.053205Z",
+ "recorded_at":"2026-10-31T10:00:51.055387Z"}
+```
+
+For backfills, `POST /v1/outcomes/batch` takes up to 1,000 outcomes and reports each one
+(`created`, `duplicate`, `conflict`, `unknown_decision` or `invalid`). Outcome events in a
+file go through the same path with the CLI, which is safe to re-run:
+
+```console
+$ uv run dgate outcomes ingest outcomes.jsonl --dead-letter rejected.jsonl
+line 4: invalid: ticket.queue@v1: answer must be one of ['billing', 'technical', 'account', 'shipping', 'other']
+created 3, duplicate 0, rejected 1
+  invalid: 1
+$ uv run dgate outcomes ingest outcomes.jsonl
+line 4: invalid: ticket.queue@v1: answer must be one of ['billing', 'technical', 'account', 'shipping', 'other']
+created 0, duplicate 3, rejected 1
+  invalid: 1
+```
+
+Each line is `{"decision_id", "outcome", "source"?, "observed_at"?}`. `GET
+/v1/outcomes/stats` then shows label coverage and how raw confidence compares with raw
+accuracy, per question version (this is what the calibrators will fix):
+
+```console
+$ curl -s localhost:8080/v1/outcomes/stats | jq '.questions[1]'
+{
+  "question": "ticket.queue",
+  "question_version": 1,
+  "decisions": 4,
+  "labeled": 3,
+  "label_rate": 0.75,
+  "accuracy": 0.6666666666666666,
+  "mean_confidence": 0.7819558140025135,
+  "confidence_gap": 0.11528914733584683
+}
+```
+
+#### Kafka
+
+With the optional extra (`uv sync --extra kafka`, or `pip install 'decision-gate[kafka]'`),
+`dgate outcomes consume` reads outcome events from a topic. Offsets are committed manually,
+one record at a time and only after it is handled, so delivery is at-least-once and
+idempotent recording makes redeliveries harmless. Events that can never succeed as sent
+(malformed, unknown decision, invalid or conflicting label) are published to a dead-letter
+topic with `dgate-reason`, `dgate-detail` and `dgate-origin` headers, then committed, so
+one bad event cannot block a partition. Anything else (say, the database is down) stops
+the consumer without committing, and the event is redelivered on restart.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -151,7 +212,10 @@ $ curl -s -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
 | `GET /readyz` | Readiness, including a database check (`503` when it is unreachable) |
 | `GET /v1/questions`, `GET /v1/questions/{id}` | Question catalog |
 | `POST /v1/decide` | Ask the backend, store and return the decision. `404` unknown question, `409` idempotency key reused for a different request, `502` backend error or invalid answer, `504` backend timeout |
-| `GET /v1/decisions/{id}` | A stored decision |
+| `GET /v1/decisions/{id}` | A stored decision, with its outcome once known |
+| `POST /v1/outcomes` | Record the ground truth for a decision. `201` created, `200` same outcome already recorded, `404` unknown decision, `409` a different outcome was recorded, `422` not a valid answer |
+| `POST /v1/outcomes/batch` | Up to 1,000 outcomes with a per-item status |
+| `GET /v1/outcomes/stats` | Per question version: decisions, labeled, label rate, raw accuracy, mean raw confidence and the gap (`?question=` filters) |
 
 ## Backends
 
@@ -180,6 +244,10 @@ never a silently stored decision.
 | `DGATE_LLM_TEMPERATURE` | `0` | Sampling temperature for `llm_json` |
 | `DGATE_FAKE_OVERCONFIDENCE` | `2.0` | Fake backend miscalibration; `1.0` is perfectly calibrated |
 | `DGATE_FAKE_SEED` | `decision-gate` | Seed for the fake backend |
+| `DGATE_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Brokers for `dgate outcomes consume` |
+| `DGATE_KAFKA_OUTCOMES_TOPIC` | `dgate.outcomes` | Topic with outcome events |
+| `DGATE_KAFKA_GROUP_ID` | `decision-gate-outcomes` | Consumer group |
+| `DGATE_KAFKA_DEAD_LETTER_TOPIC` | `dgate.outcomes.dlq` | Where rejected events go; empty disables it |
 | `DGATE_LOG_LEVEL` | `info` | `debug`, `info`, `warning` or `error` |
 
 ## Question catalog
@@ -216,8 +284,10 @@ DGATE_TEST_DATABASE_URL=postgresql+asyncpg://dgate:dgate@localhost:5432/dgate_te
 ```
 
 CI runs the checks on Python 3.12 and 3.13 with a PostgreSQL 17 service container, plus
-`uv build`, a CLI smoke test, and an API smoke test that migrates the database and checks
-an idempotent replay.
+`uv build`, a CLI smoke test, and an API smoke test that migrates the database, checks an
+idempotent replay, records an outcome over HTTP, replays it through `dgate outcomes ingest`
+and checks the stats count it once. The Kafka source is tested with in-memory consumer and
+producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License
 
