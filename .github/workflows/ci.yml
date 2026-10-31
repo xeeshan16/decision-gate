@@ -49,7 +49,7 @@ jobs:
           enable-cache: true
 
       - name: Install
-        run: uv sync --locked
+        run: uv sync --locked --all-extras
 
       - name: Lint
         run: |
@@ -84,10 +84,17 @@ jobs:
           server=$!
           trap 'kill "$server"' EXIT
           for _ in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
-          curl -sf -X POST localhost:8080/v1/decide \
+          id=$(curl -sf -X POST localhost:8080/v1/decide \
             -H 'content-type: application/json' -H 'Idempotency-Key: smoke-1' \
-            -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}'
+            -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}' | jq -r .id)
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/decide \
             -H 'content-type: application/json' -H 'Idempotency-Key: smoke-1' \
             -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}')
           test "$status" = 200
+          # Record an outcome over HTTP, replay it through the JSON Lines ingester (a
+          # duplicate, so --strict passes), and check the stats see exactly one label.
+          outcome="{\"decision_id\": \"$id\", \"outcome\": \"billing\"}"
+          curl -sf -X POST localhost:8080/v1/outcomes \
+            -H 'content-type: application/json' -d "$outcome"
+          echo "$outcome" | .venv/bin/dgate outcomes ingest - --strict
+          curl -sf localhost:8080/v1/outcomes/stats | jq -e '.questions[0].labeled == 1'

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -12,6 +14,10 @@ from decision_gate import __version__
 from decision_gate.backends import FakeBackend
 from decision_gate.backends.fake import hash_oracle
 from decision_gate.catalog import CatalogError, load_catalog
+
+if TYPE_CHECKING:
+    from decision_gate.ingest import IngestStats, OutcomeSource
+    from decision_gate.questions import QuestionCatalog
 
 app = typer.Typer(
     help="decision-gate: calibrated thresholds and human-in-the-loop routing.",
@@ -22,6 +28,8 @@ questions_app = typer.Typer(help="Inspect and validate question catalogs.", no_a
 app.add_typer(questions_app, name="questions")
 db_app = typer.Typer(help="Manage the database schema (Alembic migrations).", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+outcomes_app = typer.Typer(help="Ingest outcomes (ground truth).", no_args_is_help=True)
+app.add_typer(outcomes_app, name="outcomes")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -165,3 +173,114 @@ def fake_gap(
         typer.echo(
             f"{question.key:<32} {accuracy:>9.3f} {mean_conf:>11.3f} {mean_conf - accuracy:>+7.3f}"
         )
+
+
+OptionalCatalogPath = Annotated[
+    Path | None,
+    typer.Option("--questions", "-q", help="Question catalog. Defaults to DGATE_QUESTIONS_FILE."),
+]
+
+
+def _catalog_for_ingest(path: Path | None) -> QuestionCatalog:
+    from decision_gate.config import Settings
+
+    path = path or Settings().questions_file
+    if path is None:
+        typer.echo("error: pass --questions or set DGATE_QUESTIONS_FILE", err=True)
+        raise typer.Exit(code=2)
+    try:
+        return load_catalog(path)
+    except CatalogError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+async def _ingest(
+    database_url: str, catalog: QuestionCatalog, source: OutcomeSource
+) -> IngestStats:
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import DecisionRepository, OutcomeRepository
+    from decision_gate.ingest import OutcomeIngestor
+    from decision_gate.service import OutcomeService
+
+    engine = make_engine(database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        service = OutcomeService(catalog, DecisionRepository(sessions), OutcomeRepository(sessions))
+        return await OutcomeIngestor(service, source).run()
+    finally:
+        await engine.dispose()
+
+
+def _report(stats: IngestStats) -> None:
+    rejected = sum(stats.rejected.values())
+    typer.echo(f"created {stats.created}, duplicate {stats.duplicate}, rejected {rejected}")
+    for reason, count in sorted(stats.rejected.items()):
+        typer.echo(f"  {reason}: {count}")
+
+
+@outcomes_app.command("ingest")
+def outcomes_ingest(
+    path: Annotated[str, typer.Argument(help="JSON Lines file of outcome events, or '-'.")],
+    questions: OptionalCatalogPath = None,
+    url: DatabaseURL = None,
+    dead_letter: Annotated[
+        Path | None,
+        typer.Option(help="Append rejected events here (JSON Lines, with the reason)."),
+    ] = None,
+    strict: Annotated[
+        bool, typer.Option(help="Exit with status 1 if any event was rejected.")
+    ] = False,
+) -> None:
+    """Record outcome events from a JSON Lines file (a backfill, or a demo).
+
+    Each line is {"decision_id": ..., "outcome": ..., "source"?: ..., "observed_at"?: ...}.
+    Re-running the same file is safe: outcomes already recorded count as duplicates.
+    """
+    from decision_gate.ingest import JsonLinesSource, RejectReason, SourceMessage
+
+    catalog = _catalog_for_ingest(questions)
+
+    def warn(message: SourceMessage, reason: RejectReason, detail: str) -> None:
+        typer.echo(f"{message.position}: {reason}: {detail}", err=True)
+
+    if path == "-":
+        source = JsonLinesSource(sys.stdin, dead_letter_path=dead_letter, on_reject=warn)
+        stats = asyncio.run(_ingest(_database_url(url), catalog, source))
+    else:
+        try:
+            stream = Path(path).open(encoding="utf-8")  # noqa: SIM115 - closed below
+        except OSError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        with stream:
+            source = JsonLinesSource(stream, dead_letter_path=dead_letter, on_reject=warn)
+            stats = asyncio.run(_ingest(_database_url(url), catalog, source))
+    _report(stats)
+    if strict and stats.rejected:
+        raise typer.Exit(code=1)
+
+
+@outcomes_app.command("consume")
+def outcomes_consume(
+    questions: OptionalCatalogPath = None,
+) -> None:  # pragma: no cover - needs a Kafka broker; the source is unit-tested
+    """Consume outcome events from Kafka until interrupted (needs the 'kafka' extra).
+
+    Reads DGATE_KAFKA_BOOTSTRAP_SERVERS, DGATE_KAFKA_OUTCOMES_TOPIC, DGATE_KAFKA_GROUP_ID
+    and DGATE_KAFKA_DEAD_LETTER_TOPIC.
+    """
+    from decision_gate.config import Settings
+    from decision_gate.kafka import from_settings
+
+    settings = Settings()
+    catalog = _catalog_for_ingest(questions)
+
+    async def run() -> IngestStats:
+        async with from_settings(settings) as source:
+            return await _ingest(settings.database_url, catalog, source)
+
+    try:
+        _report(asyncio.run(run()))
+    except KeyboardInterrupt:
+        typer.echo("stopped")

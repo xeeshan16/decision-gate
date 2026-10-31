@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://dgate:dgate@localhost:5432/dgate"
@@ -48,7 +48,22 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
 
+    kafka_bootstrap_servers: str = Field(
+        default="localhost:9092", description="Kafka brokers for the outcome consumer."
+    )
+    kafka_outcomes_topic: str = "dgate.outcomes"
+    kafka_group_id: str = "decision-gate-outcomes"
+    kafka_dead_letter_topic: str | None = Field(
+        default="dgate.outcomes.dlq",
+        description="Where rejected outcome events go. Empty disables dead-lettering.",
+    )
+
     log_level: Literal["debug", "info", "warning", "error"] = "info"
+
+    @field_validator("kafka_dead_letter_topic")
+    @classmethod
+    def _empty_is_none(cls, value: str | None) -> str | None:
+        return value or None
 
     @model_validator(mode="after")
     def _check_backend_settings(self) -> Settings:
