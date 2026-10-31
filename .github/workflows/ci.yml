@@ -77,7 +77,12 @@ jobs:
         run: |
           uv run dgate db downgrade base
           uv run dgate db upgrade
-          uv run dgate serve --port 8080 &
+          # Run the installed entry point directly and stop it on exit. A server left
+          # running under `uv run` holds uv's cache lock, which makes the setup-uv
+          # post-job cache prune hang until it times out and fails the job.
+          .venv/bin/dgate serve --port 8080 &
+          server=$!
+          trap 'kill "$server"' EXIT
           for _ in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
           curl -sf -X POST localhost:8080/v1/decide \
             -H 'content-type: application/json' -H 'Idempotency-Key: smoke-1' \
