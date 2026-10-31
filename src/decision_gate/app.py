@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, get_args
 
 from fastapi import FastAPI, Header, HTTPException, Response, status
 from fastapi.responses import JSONResponse
@@ -21,10 +21,25 @@ from decision_gate.backends.factory import build_backend
 from decision_gate.catalog import load_catalog
 from decision_gate.config import Settings
 from decision_gate.db import make_engine, make_sessionmaker
-from decision_gate.db.models import DecisionRecord
-from decision_gate.db.repository import DecisionRepository
+from decision_gate.db.models import DecisionRecord, OutcomeRecord
+from decision_gate.db.repository import DecisionRepository, LabelStats, OutcomeRepository
 from decision_gate.questions import Answer, QuestionCatalog
-from decision_gate.service import BackendTimeoutError, DecisionService, IdempotencyConflictError
+from decision_gate.service import (
+    BackendTimeoutError,
+    DecisionService,
+    IdempotencyConflictError,
+    InvalidOutcomeError,
+    OutcomeConflictError,
+    OutcomeService,
+    UnknownDecisionError,
+)
+
+MAX_OUTCOME_BATCH = 1000
+
+
+def _utc(moment: datetime) -> datetime:
+    # SQLite drops the offset; values are stored in UTC.
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment
 
 
 class DecideRequest(BaseModel):
@@ -41,6 +56,94 @@ class DecideRequest(BaseModel):
     )
 
 
+class OutcomeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: uuid.UUID
+    outcome: Answer = Field(description="The true answer, in the question's answer type.")
+    source: str = Field(
+        default="api", min_length=1, max_length=64, description="Where the label came from."
+    )
+    observed_at: datetime | None = Field(
+        default=None, description="When the truth became known. Defaults to now."
+    )
+
+
+class OutcomeOut(BaseModel):
+    decision_id: uuid.UUID
+    outcome: Answer
+    correct: bool = Field(description="Whether the decision's answer matched the outcome.")
+    source: str
+    observed_at: datetime
+    recorded_at: datetime
+
+    @classmethod
+    def from_record(cls, record: OutcomeRecord) -> OutcomeOut:
+        return cls(
+            decision_id=record.decision_id,
+            outcome=record.outcome,
+            correct=record.correct,
+            source=record.source,
+            observed_at=_utc(record.observed_at),
+            recorded_at=_utc(record.recorded_at),
+        )
+
+
+class OutcomeBatchIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outcomes: list[OutcomeIn] = Field(min_length=1, max_length=MAX_OUTCOME_BATCH)
+
+
+BatchStatus = Literal["created", "duplicate", "conflict", "unknown_decision", "invalid"]
+
+
+class OutcomeBatchItem(BaseModel):
+    decision_id: uuid.UUID
+    status: BatchStatus
+    detail: str | None = None
+    correct: bool | None = None
+
+
+class OutcomeBatchOut(BaseModel):
+    results: list[OutcomeBatchItem]
+    counts: dict[str, int]
+
+
+class LabelStatsOut(BaseModel):
+    question: str
+    question_version: int
+    decisions: int
+    labeled: int
+    label_rate: float
+    accuracy: float | None = Field(description="Raw accuracy over labeled decisions.")
+    mean_confidence: float | None = Field(
+        description="Mean raw confidence over the same labeled decisions."
+    )
+    confidence_gap: float | None = Field(
+        description="mean_confidence - accuracy. Positive means the backend is overconfident."
+    )
+
+    @classmethod
+    def from_stats(cls, stats: LabelStats) -> LabelStatsOut:
+        accuracy = stats.accuracy
+        gap = (
+            stats.mean_confidence - accuracy
+            if accuracy is not None and stats.mean_confidence is not None
+            else None
+        )
+        return cls(
+            question=stats.question_id,
+            question_version=stats.question_version,
+            decisions=stats.decisions,
+            labeled=stats.labeled,
+            label_rate=stats.label_rate,
+            accuracy=accuracy,
+            mean_confidence=stats.mean_confidence,
+            confidence_gap=gap,
+        )
+
+
 class DecisionOut(BaseModel):
     id: uuid.UUID
     question: str
@@ -53,12 +156,14 @@ class DecisionOut(BaseModel):
     latency_ms: float
     idempotency_key: str | None
     created_at: datetime
+    outcome: OutcomeOut | None = Field(
+        default=None, description="Ground truth, once it has been recorded."
+    )
 
     @classmethod
-    def from_record(cls, record: DecisionRecord) -> DecisionOut:
-        created = record.created_at
-        if created.tzinfo is None:  # SQLite drops the offset; values are stored in UTC.
-            created = created.replace(tzinfo=UTC)
+    def from_record(
+        cls, record: DecisionRecord, outcome: OutcomeRecord | None = None
+    ) -> DecisionOut:
         return cls(
             id=record.id,
             question=record.question_id,
@@ -70,7 +175,8 @@ class DecisionOut(BaseModel):
             model_version=record.model_version,
             latency_ms=record.latency_ms,
             idempotency_key=record.idempotency_key,
-            created_at=created,
+            created_at=_utc(record.created_at),
+            outcome=OutcomeOut.from_record(outcome) if outcome is not None else None,
         )
 
 
@@ -88,7 +194,10 @@ def create_app(
         )
     backend = backend or build_backend(settings)
     engine = engine or make_engine(settings.database_url)
-    repository = DecisionRepository(make_sessionmaker(engine))
+    sessions = make_sessionmaker(engine)
+    repository = DecisionRepository(sessions)
+    outcome_repository = OutcomeRepository(sessions)
+    outcome_service = OutcomeService(catalog, repository, outcome_repository)
     service = DecisionService(
         backend,
         repository,
@@ -114,6 +223,7 @@ def create_app(
     app.state.catalog = catalog
     app.state.backend = backend
     app.state.engine = engine
+    app.state.outcome_service = outcome_service
 
     @app.get("/healthz", tags=["ops"])
     async def healthz() -> dict[str, str]:
@@ -190,6 +300,73 @@ def create_app(
         record = await repository.get(decision_id)
         if record is None:
             raise HTTPException(status_code=404, detail="unknown decision")
-        return DecisionOut.from_record(record)
+        return DecisionOut.from_record(record, await outcome_repository.get(decision_id))
+
+    @app.post(
+        "/v1/outcomes",
+        tags=["outcomes"],
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {"description": "The same outcome was already recorded."},
+            404: {"description": "Unknown decision."},
+            409: {"description": "A different outcome was already recorded."},
+            422: {"description": "Not a valid answer to the decision's question."},
+        },
+    )
+    async def record_outcome(request: OutcomeIn, response: Response) -> OutcomeOut:
+        """Record the ground truth for a decision. Safe to retry."""
+        try:
+            record, created = await outcome_service.record(
+                request.decision_id,
+                request.outcome,
+                source=request.source,
+                observed_at=request.observed_at,
+            )
+        except UnknownDecisionError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except OutcomeConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except InvalidOutcomeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return OutcomeOut.from_record(record)
+
+    @app.post("/v1/outcomes/batch", tags=["outcomes"])
+    async def record_outcomes(request: OutcomeBatchIn) -> OutcomeBatchOut:
+        """Record up to 1,000 outcomes, e.g. a backfill. Each item succeeds or fails alone."""
+        results: list[OutcomeBatchItem] = []
+        for item in request.outcomes:
+            results.append(await _record_one(item))
+        counts = dict.fromkeys(get_args(BatchStatus), 0)
+        for result in results:
+            counts[result.status] += 1
+        return OutcomeBatchOut(results=results, counts=counts)
+
+    async def _record_one(item: OutcomeIn) -> OutcomeBatchItem:
+        def failed(kind: BatchStatus, exc: Exception) -> OutcomeBatchItem:
+            return OutcomeBatchItem(decision_id=item.decision_id, status=kind, detail=str(exc))
+
+        try:
+            record, created = await outcome_service.record(
+                item.decision_id, item.outcome, source=item.source, observed_at=item.observed_at
+            )
+        except UnknownDecisionError as exc:
+            return failed("unknown_decision", exc)
+        except OutcomeConflictError as exc:
+            return failed("conflict", exc)
+        except InvalidOutcomeError as exc:
+            return failed("invalid", exc)
+        return OutcomeBatchItem(
+            decision_id=item.decision_id,
+            status="created" if created else "duplicate",
+            correct=record.correct,
+        )
+
+    @app.get("/v1/outcomes/stats", tags=["outcomes"])
+    async def outcome_stats(question: str | None = None) -> dict[str, list[LabelStatsOut]]:
+        """Label coverage and raw accuracy against raw confidence, per question version."""
+        stats = await outcome_repository.stats(question)
+        return {"questions": [LabelStatsOut.from_stats(s) for s in stats]}
 
     return app

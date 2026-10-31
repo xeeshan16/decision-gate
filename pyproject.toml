@@ -75,6 +75,8 @@ markers = ["postgres: integration test against PostgreSQL (needs DGATE_TEST_DATA
 [tool.coverage.run]
 source = ["decision_gate"]
 branch = true
+# SQLAlchemy's async layer runs DBAPI callbacks inside greenlets.
+concurrency = ["greenlet", "thread"]
 
 [tool.coverage.report]
 show_missing = true

@@ -6,7 +6,19 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Index, Integer, MetaData, String, Uuid, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Uuid,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -55,3 +67,25 @@ class DecisionRecord(Base):
     @property
     def question_key(self) -> str:
         return f"{self.question_id}@v{self.question_version}"
+
+
+class OutcomeRecord(Base):
+    """The ground truth for one decision, which usually arrives long after the decision.
+
+    One outcome per decision: the decision id is the primary key, so a replayed outcome
+    (an HTTP retry, a redelivered Kafka message) can never be counted twice. ``correct``
+    is computed once, when the outcome is recorded, by the question's own rule.
+    """
+
+    __tablename__ = "outcomes"
+
+    decision_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("decisions.id", ondelete="CASCADE"), primary_key=True
+    )
+    outcome: Mapped[Any] = mapped_column(JSONType)
+    correct: Mapped[bool] = mapped_column(Boolean)
+    source: Mapped[str] = mapped_column(String(64))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
+    )
