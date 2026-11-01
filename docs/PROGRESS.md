@@ -126,3 +126,47 @@ dead-letter headers, a dead database propagating without a commit, and the CLI.
 **Next (day 4):** calibration metrics: ECE, Brier score, log loss and reliability bins per
 question, backend and version, tested against hand-computed fixtures.
 
+
+## Day 4 (2026-11-01): calibration metrics
+
+CI on main was green (day 3's run passed), so the day went to the milestone.
+
+**Done**
+
+- `decision_gate.metrics`, numpy only: reliability bins (`uniform`: equal width,
+  right-closed, empty bins kept so diagrams line up; `quantile`: equal count), ECE, MCE,
+  top-label Brier score and log loss, multi-class Brier score and log loss over a full
+  distribution, and a seeded percentile-bootstrap interval for the ECE. Inputs are
+  validated (lengths, ranges, rows summing to 1) with clear errors.
+- `decision_gate.calibration.build_reports`: one report per question version, optionally
+  split by `backend` and/or `model_version`, with a `min_count` floor. Multi-class scores
+  are filled in only when every decision in the group has a distribution; a true label the
+  backend gave no probability counts as 0.
+- `OutcomeRepository.labeled_rows(...)`: labeled decisions as plain column tuples (no ORM
+  objects), filtered by question, version and decision-time window.
+- `GET /v1/calibration/metrics` (`question`, `version`, repeatable `group_by`, `bins`,
+  `strategy`, `since`, `until`, `bootstrap`, `min_count`) and `dgate calibration report`
+  with the same options, a table view, `--show-bins` reliability tables and `--json`.
+- `dgate fake-gap` now prints ECE and Brier next to the raw gap.
+- The CI smoke test checks the new endpoint and CLI against PostgreSQL after recording an
+  outcome.
+
+**Observation worth keeping:** on 1,000 labeled decisions per question, the calibrated
+fake (`m2`) has ECE 0.010 for `refund.eligible`, but its bootstrap interval is
+0.009-0.040, above the point estimate. That is the known upward bias of binned ECE on
+finite samples, applied twice by resampling. The README says to read the interval as a
+noise indicator, not a confidence interval for the true error. Day 6's threshold
+selection will rely on Wilson/Clopper-Pearson bounds on accuracy, not on ECE.
+
+**Tests:** 274 passing locally on Python 3.13 and 3.12 against SQLite and a local
+PostgreSQL 16 server, 100% line and branch coverage. Each metric has a fixture worked out
+by hand in the test file (Brier 0.222, log loss 0.6997, ECE 0.34 and MCE 0.4 on a
+five-decision set, quantile ECE 0.22, multi-class Brier 0.5), plus a zero-ECE calibrated
+case, a large-sample overconfidence check, and every validation error. Report tests check
+that the endpoint agrees with the metrics module on data recorded through the API, the
+grouping by model version and backend, time windows, `min_count`, bootstrap intervals,
+422s for bad parameters, and the CLI table, bins and JSON output.
+
+**Next (day 5):** calibrators: Platt scaling, isotonic regression (pool-adjacent-violators)
+and temperature scaling for multi-class questions, a versioned calibrator registry and a
+refit job.

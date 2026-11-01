@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 3 of a 14-day build). See
+> **Status:** under active development (day 4 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -42,7 +42,7 @@ statistical bounds, and tighten automatically when calibration drifts.
 | `POST /v1/decide` with idempotency keys, PostgreSQL persistence and Alembic migrations | ✅ day 2 |
 | Idempotent outcomes over HTTP (single and batch), label coverage and raw accuracy stats | ✅ day 3 |
 | Streaming outcome ingestion: JSON Lines CLI and an optional Kafka consumer with a dead-letter topic | ✅ day 3 |
-| ECE, Brier, log loss and reliability bins | planned (day 4) |
+| Calibration metrics: ECE (with a bootstrap interval), MCE, Brier, log loss, multi-class scores and reliability bins, per question version, backend and model | ✅ day 4 |
 | Platt, isotonic and temperature calibrators | planned (day 5) |
 | Thresholds with Wilson/Clopper-Pearson bounds, conformal sets | planned (day 6) |
 | Per-question routing policy and human review queue | planned (days 7-8) |
@@ -110,14 +110,14 @@ $ uv run dgate ask refund.eligible -q examples/questions.yaml -i '{"order_age_da
 
 The fake is deliberately overconfident by default (`overconfidence=2.0`), which is the
 problem the rest of the system exists to correct. `fake-gap` measures it on 5,000 synthetic
-inputs per question:
+inputs per question, with no database involved:
 
 ```console
 $ uv run dgate fake-gap -q examples/questions.yaml
-question                          accuracy  confidence     gap
-refund.eligible@v1                   0.755       0.849  +0.094
-ticket.queue@v1                      0.606       0.788  +0.182
-ticket.handling_minutes@v1           0.750       0.845  +0.096
+question                          accuracy  confidence     gap     ECE   Brier
+refund.eligible@v1                   0.755       0.849  +0.094   0.098   0.179
+ticket.queue@v1                      0.606       0.788  +0.182   0.182   0.231
+ticket.handling_minutes@v1           0.750       0.845  +0.096   0.096   0.178
 ```
 
 Run the API. It needs PostgreSQL (any recent version; CI uses 17):
@@ -206,6 +206,90 @@ topic with `dgate-reason`, `dgate-detail` and `dgate-origin` headers, then commi
 one bad event cannot block a partition. Anything else (say, the database is down) stops
 the consumer without committing, and the event is redelivered on restart.
 
+### Calibration metrics
+
+Once outcomes arrive, `GET /v1/calibration/metrics` and `dgate calibration report` measure
+how far the raw confidence is from the real accuracy, per question version. Every metric
+is computed on the pair every question kind reduces to: the confidence the backend gave
+its answer, and whether the answer was right.
+
+| Metric | What it tells you |
+| --- | --- |
+| Reliability bins | Mean confidence against accuracy in each confidence bin: the reliability diagram. `uniform` bins (equal width, right-closed, empty bins kept so models line up) or `quantile` bins (equal count). |
+| ECE | Sample-weighted mean of `\|accuracy - confidence\|` over the bins. `bootstrap=N` adds a seeded 95% percentile-bootstrap interval. |
+| MCE | The worst bin's gap. |
+| Brier score, log loss | Binning-free scores of the same pairs. Log loss punishes confident mistakes hardest. |
+| Multi-class Brier and log loss | For predicate and choice decisions with a full `probabilities` distribution, scored against the true label. |
+
+Split by `backend` and/or `model_version` to compare models or prompt versions. Below,
+the fake backend answered 1,000 synthetic inputs per question as `m1` (overconfident,
+`overconfidence=2.0`) and again as `m2` (calibrated, `1.0`), with outcomes from the fake's
+own ground truth recorded through the API:
+
+```console
+$ uv run dgate calibration report --by model_version --bootstrap 200
+question                     model_version       n    acc   conf    ECE       ECE 95%    MCE  Brier logloss
+refund.eligible@v1           m1               1000  0.754  0.850  0.098   0.079-0.129  0.175  0.178   0.569
+refund.eligible@v1           m2               1000  0.754  0.752  0.010   0.009-0.040  0.016  0.166   0.498
+ticket.handling_minutes@v1   m1               1000  0.754  0.829  0.075   0.056-0.103  0.105  0.168   0.521
+ticket.handling_minutes@v1   m2               1000  0.754  0.735  0.022   0.017-0.052  0.050  0.162   0.485
+ticket.queue@v1              m1               1000  0.585  0.787  0.210   0.187-0.240  0.332  0.252   0.826
+ticket.queue@v1              m2               1000  0.585  0.597  0.032   0.025-0.068  0.068  0.198   0.575
+```
+
+Same answers, same accuracy; only the stated confidence differs, and every score sees it.
+The calibrated model's interval sits above its point estimate because binned ECE is
+biased upwards on finite samples (even a perfectly calibrated model shows a gap in each
+bin), and resampling adds the same bias again. Read the interval as "how noisy is this",
+not as a confidence interval for the true calibration error.
+
+`--show-bins` prints each reliability table (empty bins trimmed here):
+
+```console
+$ uv run dgate calibration report --question refund.eligible --by model_version --show-bins
+...
+refund.eligible@v1 m1: reliability (uniform bins)
+  bin                n   conf    acc     gap  accuracy
+  0.50-0.60         96  0.550  0.562  -0.012  ###########
+  0.60-0.70        109  0.652  0.550  +0.101  ###########
+  0.70-0.80        127  0.756  0.685  +0.071  ##############
+  0.80-0.90        160  0.857  0.681  +0.175  ##############
+  0.90-1.00        508  0.970  0.874  +0.096  #################
+```
+
+The endpoint returns the same metrics as JSON, with every bin. Without `group_by`, a
+report covers every backend and model version of the question (both `m1` and `m2` here):
+
+```console
+$ curl -s 'localhost:8080/v1/calibration/metrics?question=ticket.queue&bins=2' | jq '.reports[0] | del(.bins)'
+{
+  "question": "ticket.queue",
+  "question_version": 1,
+  "backend": null,
+  "model_version": null,
+  "count": 2000,
+  "accuracy": 0.585,
+  "mean_confidence": 0.692359296785496,
+  "overconfidence": 0.10735929678549605,
+  "ece": 0.10735929678549704,
+  "ece_interval": null,
+  "mce": 0.14741396512146432,
+  "brier": 0.2251036955756147,
+  "log_loss": 0.7002494720984769,
+  "multiclass_brier": 0.5926296194695184,
+  "multiclass_log_loss": 1.2755616319632312
+}
+```
+
+Parameters: `question`, `version`, `group_by` (repeatable: `backend`, `model_version`),
+`bins` (1-100, default 10), `strategy` (`uniform` or `quantile`), `since`/`until` (decision
+time), `bootstrap` (0-1000 resamples) and `min_count` (skip smaller groups). The CLI takes
+the same options (`--by`, `--bins`, `--strategy`, `--since`, `--until`, `--bootstrap`,
+`--min-count`, `--json`). Metrics are plain numpy, implemented from scratch and tested
+against hand-worked fixtures in [tests/test_metrics.py](tests/test_metrics.py).
+
+### Endpoints
+
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness |
@@ -216,6 +300,7 @@ the consumer without committing, and the event is redelivered on restart.
 | `POST /v1/outcomes` | Record the ground truth for a decision. `201` created, `200` same outcome already recorded, `404` unknown decision, `409` a different outcome was recorded, `422` not a valid answer |
 | `POST /v1/outcomes/batch` | Up to 1,000 outcomes with a per-item status |
 | `GET /v1/outcomes/stats` | Per question version: decisions, labeled, label rate, raw accuracy, mean raw confidence and the gap (`?question=` filters) |
+| `GET /v1/calibration/metrics` | ECE, MCE, Brier, log loss, multi-class scores and reliability bins per question version, optionally per backend and model version |
 
 ## Backends
 
@@ -286,7 +371,7 @@ DGATE_TEST_DATABASE_URL=postgresql+asyncpg://dgate:dgate@localhost:5432/dgate_te
 CI runs the checks on Python 3.12 and 3.13 with a PostgreSQL 17 service container, plus
 `uv build`, a CLI smoke test, and an API smoke test that migrates the database, checks an
 idempotent replay, records an outcome over HTTP, replays it through `dgate outcomes ingest`
-and checks the stats count it once. The Kafka source is tested with in-memory consumer and
+and checks the stats count it once, then checks calibration metrics over HTTP and the CLI. The Kafka source is tested with in-memory consumer and
 producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License
