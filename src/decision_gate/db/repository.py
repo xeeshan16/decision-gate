@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
@@ -71,6 +72,20 @@ class LabelStats:
         return self.correct / self.labeled if self.labeled else None
 
 
+@dataclass(frozen=True, slots=True)
+class LabeledRow:
+    """The columns of one labeled decision that calibration needs, without ORM overhead."""
+
+    question_id: str
+    question_version: int
+    backend: str
+    model_version: str
+    confidence: float
+    correct: bool
+    probabilities: dict[str, float] | None
+    outcome: Any
+
+
 class OutcomeRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
@@ -130,6 +145,71 @@ class OutcomeRepository:
         async with self._sessions() as session:
             result = await session.execute(query)
             return [(decision, outcome) for decision, outcome in result.all()]
+
+    async def labeled_rows(
+        self,
+        *,
+        question_id: str | None = None,
+        question_version: int | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[LabeledRow]:
+        """Labeled decisions as plain rows, grouped by question version, oldest first.
+
+        Selects only the columns the metrics read, so a report over many thousands of
+        decisions does not build ORM objects. The window applies to the decision time.
+        """
+        query = (
+            select(
+                DecisionRecord.question_id,
+                DecisionRecord.question_version,
+                DecisionRecord.backend,
+                DecisionRecord.model_version,
+                DecisionRecord.confidence,
+                OutcomeRecord.correct,
+                DecisionRecord.probabilities,
+                OutcomeRecord.outcome,
+            )
+            .join(OutcomeRecord, OutcomeRecord.decision_id == DecisionRecord.id)
+            .order_by(
+                DecisionRecord.question_id,
+                DecisionRecord.question_version,
+                DecisionRecord.created_at,
+                DecisionRecord.id,
+            )
+        )
+        if question_id is not None:
+            query = query.where(DecisionRecord.question_id == question_id)
+        if question_version is not None:
+            query = query.where(DecisionRecord.question_version == question_version)
+        if since is not None:
+            query = query.where(DecisionRecord.created_at >= since)
+        if until is not None:
+            query = query.where(DecisionRecord.created_at < until)
+        async with self._sessions() as session:
+            result = await session.execute(query)
+            return [
+                LabeledRow(
+                    question_id=qid,
+                    question_version=int(version),
+                    backend=backend,
+                    model_version=model_version,
+                    confidence=float(confidence),
+                    correct=bool(correct),
+                    probabilities=probabilities,
+                    outcome=outcome,
+                )
+                for (
+                    qid,
+                    version,
+                    backend,
+                    model_version,
+                    confidence,
+                    correct,
+                    probabilities,
+                    outcome,
+                ) in result.all()
+            ]
 
     async def stats(self, question_id: str | None = None) -> list[LabelStats]:
         """Per question version: decisions, how many are labeled, and raw accuracy."""

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, get_args
 
-from fastapi import FastAPI, Header, HTTPException, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
@@ -18,11 +18,13 @@ from decision_gate import __version__
 from decision_gate.backends import DecisionBackend
 from decision_gate.backends.base import BackendError
 from decision_gate.backends.factory import build_backend
+from decision_gate.calibration import CalibrationReport, GroupField, build_reports
 from decision_gate.catalog import load_catalog
 from decision_gate.config import Settings
 from decision_gate.db import make_engine, make_sessionmaker
 from decision_gate.db.models import DecisionRecord, OutcomeRecord
 from decision_gate.db.repository import DecisionRepository, LabelStats, OutcomeRepository
+from decision_gate.metrics import BinStrategy, ReliabilityBin
 from decision_gate.questions import Answer, QuestionCatalog
 from decision_gate.service import (
     BackendTimeoutError,
@@ -142,6 +144,78 @@ class LabelStatsOut(BaseModel):
             mean_confidence=stats.mean_confidence,
             confidence_gap=gap,
         )
+
+
+class ReliabilityBinOut(BaseModel):
+    lower: float
+    upper: float
+    count: int
+    mean_confidence: float | None
+    accuracy: float | None
+    gap: float | None = Field(description="mean_confidence - accuracy; positive = overconfident.")
+
+    @classmethod
+    def from_bin(cls, b: ReliabilityBin) -> ReliabilityBinOut:
+        return cls(
+            lower=b.lower,
+            upper=b.upper,
+            count=b.count,
+            mean_confidence=b.mean_confidence,
+            accuracy=b.accuracy,
+            gap=b.gap,
+        )
+
+
+class CalibrationReportOut(BaseModel):
+    question: str
+    question_version: int
+    backend: str | None = Field(description="Null unless grouped by backend.")
+    model_version: str | None = Field(description="Null unless grouped by model_version.")
+    count: int = Field(description="Labeled decisions in this group.")
+    accuracy: float
+    mean_confidence: float
+    overconfidence: float = Field(description="mean_confidence - accuracy.")
+    ece: float = Field(description="Expected calibration error over the bins.")
+    ece_interval: tuple[float, float] | None = Field(
+        description="95% bootstrap interval for the ECE, when requested."
+    )
+    mce: float = Field(description="Largest per-bin |accuracy - confidence|.")
+    brier: float = Field(description="Top-label Brier score.")
+    log_loss: float = Field(description="Top-label log loss (nats).")
+    multiclass_brier: float | None = Field(
+        description="Brier score of the full distribution, when every decision has one."
+    )
+    multiclass_log_loss: float | None
+    bins: list[ReliabilityBinOut]
+
+    @classmethod
+    def from_report(cls, report: CalibrationReport) -> CalibrationReportOut:
+        m = report.metrics
+        return cls(
+            question=report.question_id,
+            question_version=report.question_version,
+            backend=report.backend,
+            model_version=report.model_version,
+            count=m.count,
+            accuracy=m.accuracy,
+            mean_confidence=m.mean_confidence,
+            overconfidence=m.overconfidence,
+            ece=m.ece,
+            ece_interval=m.ece_interval,
+            mce=m.mce,
+            brier=m.brier,
+            log_loss=m.log_loss,
+            multiclass_brier=m.multiclass_brier,
+            multiclass_log_loss=m.multiclass_log_loss,
+            bins=[ReliabilityBinOut.from_bin(b) for b in m.bins],
+        )
+
+
+class CalibrationMetricsOut(BaseModel):
+    n_bins: int
+    strategy: BinStrategy
+    group_by: list[GroupField]
+    reports: list[CalibrationReportOut]
 
 
 class DecisionOut(BaseModel):
@@ -368,5 +442,43 @@ def create_app(
         """Label coverage and raw accuracy against raw confidence, per question version."""
         stats = await outcome_repository.stats(question)
         return {"questions": [LabelStatsOut.from_stats(s) for s in stats]}
+
+    @app.get("/v1/calibration/metrics", tags=["calibration"])
+    async def calibration_metrics(
+        question: str | None = None,
+        version: Annotated[int | None, Query(ge=1)] = None,
+        group_by: Annotated[list[GroupField] | None, Query()] = None,
+        bins: Annotated[int, Query(ge=1, le=100)] = 10,
+        strategy: BinStrategy = "uniform",
+        since: datetime | None = None,
+        until: datetime | None = None,
+        bootstrap: Annotated[
+            int, Query(ge=0, le=1000, description="Resamples for a 95% ECE interval.")
+        ] = 0,
+        min_count: Annotated[int, Query(ge=1, description="Skip smaller groups.")] = 1,
+    ) -> CalibrationMetricsOut:
+        """ECE, MCE, Brier, log loss and reliability bins over labeled decisions.
+
+        One report per question version, split further by ``group_by=backend`` and/or
+        ``group_by=model_version``. The time window applies to the decision time.
+        """
+        fields = list(dict.fromkeys(group_by or []))
+        rows = await outcome_repository.labeled_rows(
+            question_id=question, question_version=version, since=since, until=until
+        )
+        reports = build_reports(
+            rows,
+            group_by=fields,
+            n_bins=bins,
+            strategy=strategy,
+            bootstrap=bootstrap,
+            min_count=min_count,
+        )
+        return CalibrationMetricsOut(
+            n_bins=bins,
+            strategy=strategy,
+            group_by=fields,
+            reports=[CalibrationReportOut.from_report(r) for r in reports],
+        )
 
     return app

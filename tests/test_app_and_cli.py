@@ -173,12 +173,18 @@ class TestCli:
             "ticket.handling_minutes@v1",
         ]
         assert all(float(row[3]) > 0.05 for row in rows)
+        assert all(float(row[4]) > 0.05 for row in rows)  # ECE
 
     def test_fake_gap_calibrated(self) -> None:
         args = ["fake-gap", "-q", str(EXAMPLES / "questions.yaml"), "-n", "2000"]
         result = runner.invoke(cli, [*args, "--overconfidence", "1.0"])
         rows = [line.split() for line in result.output.splitlines()[1:]]
         assert all(abs(float(row[3])) < 0.04 for row in rows)
+        assert all(float(row[4]) < 0.04 for row in rows)  # ECE
+        overconfident = runner.invoke(cli, args).output.splitlines()[1:]
+        # Calibration alone lowers the Brier score for the same answers.
+        for calibrated, raw in zip(rows, overconfident, strict=True):
+            assert float(calibrated[5]) < float(raw.split()[5])
 
     def test_fake_gap_bad_catalog(self, tmp_path: Path) -> None:
         result = runner.invoke(cli, ["fake-gap", "-q", str(tmp_path / "missing.yaml")])

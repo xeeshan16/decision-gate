@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -16,7 +17,9 @@ from decision_gate.backends.fake import hash_oracle
 from decision_gate.catalog import CatalogError, load_catalog
 
 if TYPE_CHECKING:
+    from decision_gate.calibration import CalibrationReport, GroupField
     from decision_gate.ingest import IngestStats, OutcomeSource
+    from decision_gate.metrics import BinStrategy
     from decision_gate.questions import QuestionCatalog
 
 app = typer.Typer(
@@ -30,6 +33,10 @@ db_app = typer.Typer(help="Manage the database schema (Alembic migrations).", no
 app.add_typer(db_app, name="db")
 outcomes_app = typer.Typer(help="Ingest outcomes (ground truth).", no_args_is_help=True)
 app.add_typer(outcomes_app, name="outcomes")
+calibration_app = typer.Typer(
+    help="Measure calibration on labeled decisions.", no_args_is_help=True
+)
+app.add_typer(calibration_app, name="calibration")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -159,19 +166,24 @@ def fake_gap(
     except CatalogError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+    from decision_gate.metrics import calibration_metrics
+
     backend = FakeBackend(overconfidence=overconfidence)
-    typer.echo(f"{'question':<32} {'accuracy':>9} {'confidence':>11} {'gap':>7}")
+    typer.echo(
+        f"{'question':<32} {'accuracy':>9} {'confidence':>11} {'gap':>7} {'ECE':>7} {'Brier':>7}"
+    )
     for question in catalog.questions:
-        correct = 0
-        confidence = 0.0
+        confidences: list[float] = []
+        hits: list[bool] = []
         for i in range(samples):
             data = {"item": i}
             decision = backend.decide_sync(question, data)
-            correct += question.is_correct(decision.answer, hash_oracle(question, data))
-            confidence += decision.confidence
-        accuracy, mean_conf = correct / samples, confidence / samples
+            confidences.append(decision.confidence)
+            hits.append(question.is_correct(decision.answer, hash_oracle(question, data)))
+        m = calibration_metrics(confidences, hits)
         typer.echo(
-            f"{question.key:<32} {accuracy:>9.3f} {mean_conf:>11.3f} {mean_conf - accuracy:>+7.3f}"
+            f"{question.key:<32} {m.accuracy:>9.3f} {m.mean_confidence:>11.3f} "
+            f"{m.overconfidence:>+7.3f} {m.ece:>7.3f} {m.brier:>7.3f}"
         )
 
 
@@ -284,3 +296,150 @@ def outcomes_consume(
         _report(asyncio.run(run()))
     except KeyboardInterrupt:
         typer.echo("stopped")
+
+
+async def _calibration_reports(
+    database_url: str,
+    *,
+    question: str | None,
+    version: int | None,
+    group_by: list[GroupField],
+    n_bins: int,
+    strategy: BinStrategy,
+    since: datetime | None,
+    until: datetime | None,
+    bootstrap: int,
+    min_count: int,
+) -> list[CalibrationReport]:
+    from decision_gate.calibration import build_reports
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import OutcomeRepository
+
+    engine = make_engine(database_url)
+    try:
+        repository = OutcomeRepository(make_sessionmaker(engine))
+        rows = await repository.labeled_rows(
+            question_id=question, question_version=version, since=since, until=until
+        )
+    finally:
+        await engine.dispose()
+    return build_reports(
+        rows,
+        group_by=group_by,
+        n_bins=n_bins,
+        strategy=strategy,
+        bootstrap=bootstrap,
+        min_count=min_count,
+    )
+
+
+def _fmt(value: float | None, spec: str = ".3f") -> str:
+    return "-" if value is None else format(value, spec)
+
+
+def _print_report_table(reports: list[CalibrationReport], group_by: list[GroupField]) -> None:
+    group_header = "".join(f" {field:<14}" for field in group_by)
+    typer.echo(
+        f"{'question':<28}{group_header} {'n':>6} {'acc':>6} {'conf':>6} {'ECE':>6} "
+        f"{'ECE 95%':>13} {'MCE':>6} {'Brier':>6} {'logloss':>7}"
+    )
+    for r in reports:
+        m = r.metrics
+        groups = "".join(
+            f" {(r.backend if field == 'backend' else r.model_version) or '':<14.14}"
+            for field in group_by
+        )
+        interval = f"{m.ece_interval[0]:.3f}-{m.ece_interval[1]:.3f}" if m.ece_interval else "-"
+        typer.echo(
+            f"{r.question_key:<28.28}{groups} {m.count:>6} {m.accuracy:>6.3f} "
+            f"{m.mean_confidence:>6.3f} {m.ece:>6.3f} {interval:>13} {m.mce:>6.3f} "
+            f"{m.brier:>6.3f} {m.log_loss:>7.3f}"
+        )
+
+
+def _print_bins(report: CalibrationReport) -> None:
+    label = " ".join(x for x in (report.question_key, report.backend, report.model_version) if x)
+    typer.echo(f"\n{label}: reliability ({report.metrics.strategy} bins)")
+    typer.echo(f"  {'bin':<13} {'n':>6} {'conf':>6} {'acc':>6} {'gap':>7}  accuracy")
+    for b in report.metrics.bins:
+        bar = "#" * round((b.accuracy or 0.0) * 20)
+        typer.echo(
+            f"  {b.lower:.2f}-{b.upper:.2f}{'':<4} {b.count:>6} {_fmt(b.mean_confidence):>6} "
+            f"{_fmt(b.accuracy):>6} {_fmt(b.gap, '+.3f'):>7}  {bar}".rstrip()
+        )
+
+
+@calibration_app.command("report")
+def calibration_report(
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    version: Annotated[int | None, typer.Option(min=1, help="Only this question version.")] = None,
+    by: Annotated[
+        list[str] | None,
+        typer.Option("--by", help="Also split by 'backend' and/or 'model_version'."),
+    ] = None,
+    bins: Annotated[int, typer.Option(min=1, max=100, help="Number of bins.")] = 10,
+    strategy: Annotated[
+        str, typer.Option(help="'uniform' (equal width) or 'quantile' (equal count) bins.")
+    ] = "uniform",
+    since: Annotated[
+        datetime | None, typer.Option(help="Decisions made at or after this time (UTC).")
+    ] = None,
+    until: Annotated[
+        datetime | None, typer.Option(help="Decisions made before this time (UTC).")
+    ] = None,
+    bootstrap: Annotated[
+        int, typer.Option(min=0, max=10_000, help="Resamples for a 95% ECE interval.")
+    ] = 0,
+    min_count: Annotated[int, typer.Option(min=1, help="Skip smaller groups.")] = 1,
+    show_bins: Annotated[
+        bool, typer.Option("--show-bins", help="Print each reliability table.")
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead.")] = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Calibration metrics over labeled decisions, per question version."""
+    from decision_gate.calibration import GROUP_FIELDS
+
+    fields: list[GroupField] = []
+    for field in by or []:
+        if field not in GROUP_FIELDS:
+            typer.echo(f"error: --by must be one of {list(GROUP_FIELDS)}", err=True)
+            raise typer.Exit(code=2)
+        if field not in fields:
+            fields.append(field)
+    if strategy not in ("uniform", "quantile"):
+        typer.echo("error: --strategy must be 'uniform' or 'quantile'", err=True)
+        raise typer.Exit(code=2)
+    reports = asyncio.run(
+        _calibration_reports(
+            _database_url(url),
+            question=question,
+            version=version,
+            group_by=fields,
+            n_bins=bins,
+            strategy=strategy,  # type: ignore[arg-type]
+            since=_as_utc(since),
+            until=_as_utc(until),
+            bootstrap=bootstrap,
+            min_count=min_count,
+        )
+    )
+    if as_json:
+        from decision_gate.app import CalibrationReportOut
+
+        payload = [CalibrationReportOut.from_report(r).model_dump(mode="json") for r in reports]
+        typer.echo(json.dumps({"group_by": fields, "reports": payload}, indent=2))
+        return
+    if not reports:
+        typer.echo("no labeled decisions match")
+        return
+    _print_report_table(reports, fields)
+    if show_bins:
+        for report in reports:
+            _print_bins(report)
+
+
+def _as_utc(moment: datetime | None) -> datetime | None:
+    if moment is None or moment.tzinfo is not None:
+        return moment
+    return moment.replace(tzinfo=UTC)

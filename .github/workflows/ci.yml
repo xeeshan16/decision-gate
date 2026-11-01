@@ -98,3 +98,7 @@ jobs:
             -H 'content-type: application/json' -d "$outcome"
           echo "$outcome" | .venv/bin/dgate outcomes ingest - --strict
           curl -sf localhost:8080/v1/outcomes/stats | jq -e '.questions[0].labeled == 1'
+          # Calibration metrics see the same single label, over HTTP and the CLI.
+          curl -sf 'localhost:8080/v1/calibration/metrics?bins=5' \
+            | jq -e '.reports[0].count == 1 and (.reports[0].bins | length) == 5'
+          .venv/bin/dgate calibration report --bins 5 --show-bins
