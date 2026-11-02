@@ -170,3 +170,73 @@ grouping by model version and backend, time windows, `min_count`, bootstrap inte
 **Next (day 5):** calibrators: Platt scaling, isotonic regression (pool-adjacent-violators)
 and temperature scaling for multi-class questions, a versioned calibrator registry and a
 refit job.
+
+
+## Day 5 (2026-11-02): calibrators, registry and refit job
+
+CI on main was green (day 4's run passed), so the day went to the milestone.
+
+**Done**
+
+- `decision_gate.calibrators`, numpy only:
+  - Platt scaling by Newton's method with a backtracking line search, starting from the
+    identity, on Platt's smoothed targets (finite parameters for separable or one-class
+    data).
+  - Isotonic regression: a linear-time, stack-based pool-adjacent-violators, ties pooled
+    into weighted points, redundant knots dropped, linear interpolation between blocks,
+    outputs kept within [0.001, 0.999].
+  - Temperature scaling for full distributions, fitted by golden-section search on
+    `1/T` (the NLL is convex in it), bounded to T in [0.05, 20].
+  - Every calibrator returns the calibrated probability of the decided answer and
+    round-trips its parameters through JSON.
+- Calibrator registry: a `calibrators` table (migration 0003) with per-question-version
+  fit numbers, status (`active`, `candidate`, `rejected`, `retired`), parameters, the
+  training window and the held-out evaluation. A partial unique index allows one active
+  calibrator per question version; activation retires the old one in the same
+  transaction, and concurrent fits retry on the version unique constraint.
+- Refit job: chronological split (newest 30% held out by default), every candidate method
+  fitted on the older part, the best by held-out log loss (Brier breaks ties) stored, and
+  activated only if it strictly beats the raw confidences and the active calibrator on
+  the same held-out decisions. Too few labels store nothing.
+- `POST /v1/calibrators/refit`, `GET /v1/calibrators`, `GET /v1/calibrators/{id}`,
+  `POST /v1/calibrators/{id}/activate`; `dgate calibrators refit [QUESTION | --all]`,
+  `list`, `show`, `activate`; `dgate fake-calibrate` for a database-free comparison.
+- `LabeledRow` now carries the decided answer and the decision time (temperature scaling
+  needs the answer key, the split needs the time).
+- CI's API smoke test runs the refit job over HTTP and the CLI against PostgreSQL.
+
+**Real run (in the README):** 1,000 labeled decisions per question from the fake with
+overconfidence 2, recorded through the API into PostgreSQL 16. The refit job activated
+temperature scaling for `ticket.queue` with T = 2.15 (held-out log loss 0.823 to 0.567,
+ECE 0.225 to 0.043) and for `refund.eligible` (0.550 to 0.495). A later isotonic fit was
+rejected because it did not beat the active calibrator.
+
+**Honest gaps:**
+
+- For `ticket.handling_minutes` Platt won by 0.001 log loss on 300 held-out decisions and
+  was promoted, because the rule is "strictly better". That is within noise. A minimum
+  improvement margin (or a paired bootstrap test) belongs with the routing policy on
+  day 7, where promotion actually changes behaviour.
+- The stored calibrator is the one fitted on 70% of the data, so the recorded held-out
+  numbers describe exactly the deployed model. Refitting on all data after selection
+  would use more labels but leave the deployed model unevaluated; I chose the former.
+- Calibrated probabilities are not applied to `/v1/decide` responses yet (day 7).
+- The concurrent-version test runs on PostgreSQL only; SQLite serialises writers. The
+  exact-race branches (repeated lost version races, a concurrent activation) are marked
+  `no cover`.
+
+**Tests:** 343 passing locally on Python 3.13 and 3.12 against SQLite and a local
+PostgreSQL 16 server, 100% line and branch coverage. Hand-worked fixtures: PAV on small
+sequences (including a cascade merge), isotonic knots and interpolation, Platt on a
+constant input (41/60 from the smoothed targets), temperature scaling at T = 2 (0.8/0.2
+becomes 2/3 and 1/3, NLL log 1.5). Optimality checks: Platt's gradient is zero at the fit,
+the temperature fit is a minimum. Recovery checks: Platt recovers a = 0.5 and temperature
+scaling recovers T = 2 from synthetic data with a known distortion. Registry and job tests
+cover versions, rollback, the one-active index, rejection against raw and against the
+incumbent, candidates, an incumbent that cannot be scored, windows, `--all`, the HTTP
+endpoints and the CLI.
+
+**Next (day 6):** threshold selection: thresholds that meet a target precision or error
+rate using Wilson and Clopper-Pearson bounds, and split-conformal prediction sets for
+choice questions.
+

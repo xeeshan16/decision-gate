@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 4 of a 14-day build). See
+> **Status:** under active development (day 5 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -43,7 +43,7 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Idempotent outcomes over HTTP (single and batch), label coverage and raw accuracy stats | ✅ day 3 |
 | Streaming outcome ingestion: JSON Lines CLI and an optional Kafka consumer with a dead-letter topic | ✅ day 3 |
 | Calibration metrics: ECE (with a bootstrap interval), MCE, Brier, log loss, multi-class scores and reliability bins, per question version, backend and model | ✅ day 4 |
-| Platt, isotonic and temperature calibrators | planned (day 5) |
+| Platt, isotonic and temperature calibrators, a versioned calibrator registry and a refit job that promotes a fit only if it wins on held-out decisions | ✅ day 5 |
 | Thresholds with Wilson/Clopper-Pearson bounds, conformal sets | planned (day 6) |
 | Per-question routing policy and human review queue | planned (days 7-8) |
 | Drift detection, shadow mode, simulator, observability | planned (days 9-12) |
@@ -288,6 +288,88 @@ the same options (`--by`, `--bins`, `--strategy`, `--since`, `--until`, `--boots
 `--min-count`, `--json`). Metrics are plain numpy, implemented from scratch and tested
 against hand-worked fixtures in [tests/test_metrics.py](tests/test_metrics.py).
 
+### Calibrators and the refit job
+
+Metrics say how wrong the raw confidence is; calibrators fix it. Three are implemented
+from scratch in [calibrators.py](src/decision_gate/calibrators.py) (numpy only):
+
+| Method | Fits | Use it when |
+| --- | --- | --- |
+| `platt` | `p = sigmoid(a * logit(c) + b)` by Newton's method, with Platt's smoothed targets so separable or one-class data still give finite parameters | Little data, or a distortion that is a stretch and shift in log-odds. Works for every question kind. |
+| `isotonic` | The best non-decreasing step function (pool-adjacent-violators), interpolated linearly, kept within [0.001, 0.999] | Plenty of data and an irregular distortion. `auto` only tries it with 200+ training decisions. |
+| `temperature` | One temperature `T` for the full distribution, `p_i ∝ p_i^(1/T)`, by golden-section search on `1/T` (the log loss is convex there) | Predicate and choice questions with a `probabilities` distribution. Never changes which answer ranks first. |
+
+The refit job (`POST /v1/calibrators/refit`, `dgate calibrators refit`) works per question
+version:
+
+1. load the labeled decisions, oldest first, and hold out the newest 30% (`holdout`). A
+   chronological split asks the question that matters: does a calibrator fitted on the
+   past help on decisions it has never seen?
+2. fit every candidate method on the older part (`method=auto`, or name one);
+3. score the raw confidences, each candidate and the currently active calibrator on the
+   held-out part, and keep the candidate with the lowest held-out log loss;
+4. store it as the next version in the registry. It becomes `active` only if it beats
+   both the raw confidences and the active calibrator on the same held-out decisions;
+   otherwise it is stored as `rejected` with the reason (or `candidate` with
+   `activate=false`). Fewer than `min_count` labels (default 100) stores nothing.
+
+The stored calibrator is the one fitted on the training split, so its recorded held-out
+numbers describe exactly the model that runs. A partial unique index allows only one
+active calibrator per question version, and `POST /v1/calibrators/{id}/activate` rolls
+back to any earlier fit.
+
+With the same fake setup as above (1,000 labeled decisions per question from an
+overconfident fake, `overconfidence=2.0`, recorded through the API into PostgreSQL):
+
+```console
+$ uv run dgate calibrators refit --all
+refund.eligible@v1           activated  n=1000   temperature held-out log loss 0.4952 beats raw 0.5502  [v1 eba83f41-2b10-444c-bc04-15628886680d]
+ticket.handling_minutes@v1   activated  n=1000   platt held-out log loss 0.4466 beats raw 0.4476  [v1 c0c9562b-0f8d-4ac5-8a14-586976069e71]
+ticket.queue@v1              activated  n=1000   temperature held-out log loss 0.5667 beats raw 0.8228  [v1 dd6b5a54-d2cc-438a-9e32-5e603883daa2]
+$ uv run dgate calibrators refit refund.eligible --method isotonic
+refund.eligible@v1           rejected   n=1000   isotonic held-out log loss 0.5144 does not beat active v1 (temperature) 0.4952  [v2 3298abd8-02b7-43e0-a262-c75815593c3e]
+$ uv run dgate calibrators list
+question                      ver method       status      train holdout   raw LL   cal LL  cal ECE  id
+refund.eligible@v1              2 isotonic     rejected      700     300   0.5502   0.5144    0.056  3298abd8-02b7-43e0-a262-c75815593c3e
+refund.eligible@v1              1 temperature  active        700     300   0.5502   0.4952    0.023  eba83f41-2b10-444c-bc04-15628886680d
+ticket.handling_minutes@v1      1 platt        active        700     300   0.4476   0.4466    0.041  c0c9562b-0f8d-4ac5-8a14-586976069e71
+ticket.queue@v1                 1 temperature  active        700     300   0.8228   0.5667    0.043  dd6b5a54-d2cc-438a-9e32-5e603883daa2
+```
+
+The fitted temperature for `ticket.queue` is 2.15, close to the fake's built-in
+overconfidence of 2 (for the fake's distributions, overconfidence `k` in log-odds is
+exactly temperature `k`). Held-out ECE drops from 0.225 to 0.043. The score question shows
+the honest flip side: on these 300 held-out decisions Platt scaling barely beats the raw
+scores (0.4466 against 0.4476) and is still promoted, because the rule is "strictly
+better". A minimum improvement margin is on the list for the routing policy (day 7).
+
+`dgate fake-calibrate` runs the same comparison without a database, on fresh fake
+decisions (5,000 per question, 30% held out):
+
+```console
+$ uv run dgate fake-calibrate -q examples/questions.yaml
+question                         method           ECE   Brier  logloss  parameters
+refund.eligible@v1               raw            0.087   0.170   0.5379
+                                 platt          0.027   0.161   0.4849  a=0.439 b=0.102
+                                 isotonic       0.024   0.161   0.4879  145 knots
+                                 temperature    0.022   0.161   0.4849  temperature=2.113
+ticket.queue@v1                  raw            0.185   0.230   0.7556
+                                 platt          0.026   0.187   0.5509  a=0.480 b=-0.606
+                                 isotonic       0.036   0.188   0.5537  152 knots
+                                 temperature    0.025   0.187   0.5508  temperature=1.974
+ticket.handling_minutes@v1       raw            0.114   0.191   0.6174
+                                 platt          0.026   0.176   0.5241  a=0.503 b=0.049
+                                 isotonic       0.033   0.177   0.5335  212 knots
+```
+
+Refit options: `question`, `version` (default: latest in the catalog), `method` (`auto`,
+`platt`, `isotonic`, `temperature`), `holdout` (fraction, default 0.3), `min_count`
+(default 100), `since`/`until` (decision time) and `activate` (default true). The CLI adds
+`--all` to refit every question version that has labels, which is what a scheduled job
+runs. Hand-worked fixtures, optimality checks and recovery of known distortions are in
+[tests/test_calibrators.py](tests/test_calibrators.py). Calibrated probabilities are not yet applied to `/v1/decide` responses; that comes
+with the routing tiers on day 7.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -301,6 +383,9 @@ against hand-worked fixtures in [tests/test_metrics.py](tests/test_metrics.py).
 | `POST /v1/outcomes/batch` | Up to 1,000 outcomes with a per-item status |
 | `GET /v1/outcomes/stats` | Per question version: decisions, labeled, label rate, raw accuracy, mean raw confidence and the gap (`?question=` filters) |
 | `GET /v1/calibration/metrics` | ECE, MCE, Brier, log loss, multi-class scores and reliability bins per question version, optionally per backend and model version |
+| `POST /v1/calibrators/refit` | Fit calibrators on labeled decisions and activate the best if it wins on held-out data. `404` unknown question, `422` invalid options (e.g. `temperature` on a score question) |
+| `GET /v1/calibrators`, `GET /v1/calibrators/{id}` | The calibrator registry (`?question=`, `?version=`, `?status=` filter) with parameters and held-out evaluation |
+| `POST /v1/calibrators/{id}/activate` | Make a stored calibrator active (roll back); the current one is retired |
 
 ## Backends
 
@@ -371,8 +456,9 @@ DGATE_TEST_DATABASE_URL=postgresql+asyncpg://dgate:dgate@localhost:5432/dgate_te
 CI runs the checks on Python 3.12 and 3.13 with a PostgreSQL 17 service container, plus
 `uv build`, a CLI smoke test, and an API smoke test that migrates the database, checks an
 idempotent replay, records an outcome over HTTP, replays it through `dgate outcomes ingest`
-and checks the stats count it once, then checks calibration metrics over HTTP and the CLI. The Kafka source is tested with in-memory consumer and
-producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
+and checks the stats count it once, then checks calibration metrics over HTTP and the CLI
+and runs the refit job (skipped on one label) against the calibrator registry. The Kafka
+source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License
 
