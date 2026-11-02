@@ -7,7 +7,7 @@ import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from decision_gate.ingest import IngestStats, OutcomeSource
     from decision_gate.metrics import BinStrategy
     from decision_gate.questions import QuestionCatalog
+    from decision_gate.refit import RefitResult
 
 app = typer.Typer(
     help="decision-gate: calibrated thresholds and human-in-the-loop routing.",
@@ -37,6 +38,10 @@ calibration_app = typer.Typer(
     help="Measure calibration on labeled decisions.", no_args_is_help=True
 )
 app.add_typer(calibration_app, name="calibration")
+calibrators_app = typer.Typer(
+    help="Fit, list and activate calibrators (the versioned registry).", no_args_is_help=True
+)
+app.add_typer(calibrators_app, name="calibrators")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -443,3 +448,262 @@ def _as_utc(moment: datetime | None) -> datetime | None:
     if moment is None or moment.tzinfo is not None:
         return moment
     return moment.replace(tzinfo=UTC)
+
+
+@app.command("fake-calibrate")
+def fake_calibrate(
+    questions: CatalogPath,
+    samples: Annotated[
+        int, typer.Option("--samples", "-n", min=20, help="Inputs per question.")
+    ] = 5000,
+    overconfidence: Annotated[
+        float, typer.Option(help="Fake backend overconfidence (1.0 = calibrated).")
+    ] = 2.0,
+    holdout: Annotated[float, typer.Option(min=0.05, max=0.95, help="Held-out fraction.")] = 0.3,
+) -> None:
+    """Fit every calibrator on the fake backend and compare them on held-out inputs.
+
+    Needs no database: decisions and ground truth come from the fake backend, the first
+    part of the inputs trains and the rest is held out.
+    """
+    try:
+        catalog = load_catalog(questions)
+    except CatalogError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    from decision_gate.calibrators import fit_calibrator
+    from decision_gate.db.repository import LabeledRow
+    from decision_gate.refit import calibration_data, candidate_methods, score
+
+    backend = FakeBackend(overconfidence=overconfidence)
+    n_train = samples - max(1, round(samples * holdout))
+    typer.echo(
+        f"{'question':<32} {'method':<12} {'ECE':>7} {'Brier':>7} {'logloss':>8}  parameters"
+    )
+    for question in catalog.questions:
+        rows: list[LabeledRow] = []
+        for i in range(samples):
+            data = {"item": i}
+            decision = backend.decide_sync(question, data)
+            truth = hash_oracle(question, data)
+            rows.append(
+                LabeledRow(
+                    question_id=question.id,
+                    question_version=question.version,
+                    backend=decision.backend,
+                    model_version=decision.model_version,
+                    confidence=decision.confidence,
+                    correct=question.is_correct(decision.answer, truth),
+                    probabilities=decision.probabilities,
+                    outcome=truth,
+                    answer=decision.answer,
+                )
+            )
+        everything = calibration_data(rows)
+        train = everything.subset(slice(0, n_train))
+        test = everything.subset(slice(n_train, None))
+        raw = score(test.confidences, test.correct)
+        typer.echo(
+            f"{question.key:<32} {'raw':<12} {raw['ece']:>7.3f} {raw['brier']:>7.3f} "
+            f"{raw['log_loss']:>8.4f}"
+        )
+        for method in candidate_methods("auto", train):
+            calibrator = fit_calibrator(method, train)
+            m = score(calibrator.predict(test), test.correct)
+            params = calibrator.params()
+            shown = (
+                f"{len(params['x'])} knots"
+                if method == "isotonic"
+                else " ".join(f"{k}={v:.3f}" for k, v in params.items())
+            )
+            typer.echo(
+                f"{'':<32} {method:<12} {m['ece']:>7.3f} {m['brier']:>7.3f} "
+                f"{m['log_loss']:>8.4f}  {shown}"
+            )
+
+
+async def _with_refit_job(database_url: str, work: Any) -> Any:
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import CalibratorRepository, OutcomeRepository
+    from decision_gate.refit import RefitJob
+
+    engine = make_engine(database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        calibrators = CalibratorRepository(sessions)
+        return await work(RefitJob(OutcomeRepository(sessions), calibrators), calibrators)
+    finally:
+        await engine.dispose()
+
+
+def _print_refit(result: RefitResult) -> None:
+    line = f"{result.question_key:<28} {result.outcome:<10} n={result.labeled:<6} {result.reason}"
+    if result.record is not None:
+        line += f"  [v{result.record.version} {result.record.id}]"
+    typer.echo(line)
+
+
+@calibrators_app.command("refit")
+def calibrators_refit(
+    question: Annotated[
+        str | None, typer.Argument(help="Question id. Omit with --all to refit everything.")
+    ] = None,
+    version: Annotated[
+        int | None, typer.Option(min=1, help="Question version (default: latest in catalog).")
+    ] = None,
+    refit_all: Annotated[
+        bool, typer.Option("--all", help="Refit every question version with labels.")
+    ] = False,
+    method: Annotated[str, typer.Option(help="auto, platt, isotonic or temperature.")] = "auto",
+    holdout: Annotated[
+        float, typer.Option(min=0.01, max=0.99, help="Newest fraction held out.")
+    ] = 0.3,
+    min_count: Annotated[int, typer.Option(min=2, help="Skip with fewer labels.")] = 100,
+    since: Annotated[
+        datetime | None, typer.Option(help="Decisions made at or after this time (UTC).")
+    ] = None,
+    until: Annotated[
+        datetime | None, typer.Option(help="Decisions made before this time (UTC).")
+    ] = None,
+    activate: Annotated[
+        bool, typer.Option("--activate/--no-activate", help="Activate a fit that helps.")
+    ] = True,
+    questions: OptionalCatalogPath = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead.")] = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Fit calibrators on labeled decisions; activate the best one if it beats the rest."""
+    from decision_gate.calibrators import CalibrationError
+    from decision_gate.refit import METHOD_CHOICES
+
+    if method not in METHOD_CHOICES:
+        typer.echo(f"error: --method must be one of {list(METHOD_CHOICES)}", err=True)
+        raise typer.Exit(code=2)
+    if (question is None) == (not refit_all):
+        typer.echo("error: give a question id or --all (not both)", err=True)
+        raise typer.Exit(code=2)
+    if question is not None and version is None:
+        catalog = _catalog_for_ingest(questions)
+        try:
+            version = catalog.get(question).version
+        except KeyError as exc:
+            typer.echo(f"error: {exc.args[0]}", err=True)
+            raise typer.Exit(code=1) from exc
+    options: dict[str, Any] = {
+        "method": method,
+        "holdout": holdout,
+        "min_count": min_count,
+        "since": _as_utc(since),
+        "until": _as_utc(until),
+        "activate": activate,
+    }
+
+    async def work(job: Any, _calibrators: Any) -> list[RefitResult]:
+        if question is None:
+            results: list[RefitResult] = await job.refit_all(**options)
+            return results
+        assert version is not None
+        return [await job.refit(question, version, **options)]
+
+    try:
+        results: list[RefitResult] = asyncio.run(_with_refit_job(_database_url(url), work))
+    except CalibrationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        from decision_gate.app import RefitOut
+
+        payload = [RefitOut.from_result(r).model_dump(mode="json") for r in results]
+        typer.echo(json.dumps({"results": payload}, indent=2))
+        return
+    if not results:
+        typer.echo("no labeled decisions")
+        return
+    for result in results:
+        _print_refit(result)
+
+
+@calibrators_app.command("list")
+def calibrators_list(
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    status: Annotated[
+        str | None, typer.Option(help="active, candidate, rejected or retired.")
+    ] = None,
+    url: DatabaseURL = None,
+) -> None:
+    """The calibrator registry, newest fit first within each question version."""
+
+    async def work(_job: Any, calibrators: Any) -> Any:
+        return await calibrators.find(question_id=question, status=status)
+
+    records = asyncio.run(_with_refit_job(_database_url(url), work))
+    if not records:
+        typer.echo("no calibrators")
+        return
+    typer.echo(
+        f"{'question':<28} {'ver':>4} {'method':<12} {'status':<10} {'train':>6} "
+        f"{'holdout':>7} {'raw LL':>8} {'cal LL':>8} {'cal ECE':>8}  id"
+    )
+    for r in records:
+        raw, cal = r.evaluation.get("raw", {}), r.evaluation.get("calibrated", {})
+        typer.echo(
+            f"{r.question_key:<28.28} {r.version:>4} {r.method:<12} {r.status:<10} "
+            f"{r.train_count:>6} {r.holdout_count:>7} {_fmt(raw.get('log_loss'), '.4f'):>8} "
+            f"{_fmt(cal.get('log_loss'), '.4f'):>8} {_fmt(cal.get('ece')):>8}  {r.id}"
+        )
+
+
+@calibrators_app.command("show")
+def calibrators_show(
+    calibrator_id: Annotated[str, typer.Argument(help="Calibrator id.")],
+    url: DatabaseURL = None,
+) -> None:
+    """Print one calibrator as JSON, with its parameters and held-out evaluation."""
+    import uuid
+
+    from decision_gate.app import CalibratorOut
+
+    try:
+        key = uuid.UUID(calibrator_id)
+    except ValueError as exc:
+        typer.echo("error: not a calibrator id", err=True)
+        raise typer.Exit(code=2) from exc
+
+    async def work(_job: Any, calibrators: Any) -> Any:
+        return await calibrators.get(key)
+
+    record = asyncio.run(_with_refit_job(_database_url(url), work))
+    if record is None:
+        typer.echo("error: unknown calibrator", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(CalibratorOut.from_record(record).model_dump(mode="json"), indent=2))
+
+
+@calibrators_app.command("activate")
+def calibrators_activate(
+    calibrator_id: Annotated[str, typer.Argument(help="Calibrator id.")],
+    url: DatabaseURL = None,
+) -> None:
+    """Make a stored calibrator the active one (e.g. roll back); retires the current one."""
+    import uuid
+
+    try:
+        key = uuid.UUID(calibrator_id)
+    except ValueError as exc:
+        typer.echo("error: not a calibrator id", err=True)
+        raise typer.Exit(code=2) from exc
+
+    from decision_gate.db.repository import ActivationConflictError
+
+    async def work(_job: Any, calibrators: Any) -> Any:
+        return await calibrators.activate(key)
+
+    try:
+        record = asyncio.run(_with_refit_job(_database_url(url), work))
+    except ActivationConflictError as exc:  # pragma: no cover - needs a concurrent race
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if record is None:
+        typer.echo("error: unknown calibrator", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"activated {record.question_key} v{record.version} ({record.method}) {record.id}")

@@ -8,7 +8,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from decision_gate.db.models import Base, DecisionRecord, OutcomeRecord
+from decision_gate.db.models import Base, CalibratorRecord, DecisionRecord, OutcomeRecord
 
 
 def make_engine(url: str) -> AsyncEngine:
@@ -33,4 +33,11 @@ def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker:  # type: ignor
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-__all__ = ["Base", "DecisionRecord", "OutcomeRecord", "make_engine", "make_sessionmaker"]
+__all__ = [
+    "Base",
+    "CalibratorRecord",
+    "DecisionRecord",
+    "OutcomeRecord",
+    "make_engine",
+    "make_sessionmaker",
+]

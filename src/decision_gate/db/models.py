@@ -16,8 +16,10 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -89,3 +91,52 @@ class OutcomeRecord(Base):
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
     )
+
+
+class CalibratorRecord(Base):
+    """One fitted calibrator for a question version, kept forever for audit.
+
+    ``version`` counts fits per question version (1, 2, ...). At most one calibrator per
+    question version is ``active``; a partial unique index enforces that, so two
+    concurrent activations cannot both win. The others are ``candidate`` (beat the raw
+    scores but were not activated), ``rejected`` (did not beat the raw scores or the
+    active calibrator on held-out decisions) or ``retired`` (replaced).
+    """
+
+    __tablename__ = "calibrators"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    question_id: Mapped[str] = mapped_column(String(64))
+    question_version: Mapped[int] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer)
+    method: Mapped[str] = mapped_column(String(32))
+    params: Mapped[dict[str, Any]] = mapped_column(JSONType)
+    status: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str] = mapped_column(String(500))
+    train_count: Mapped[int] = mapped_column(Integer)
+    holdout_count: Mapped[int] = mapped_column(Integer)
+    trained_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """Decision time of the oldest training decision."""
+    trained_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """Decision time of the newest training decision; held-out decisions are all later."""
+    evaluation: Mapped[dict[str, Any]] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("question_id", "question_version", "version"),
+        Index(
+            "uq_calibrators_one_active",
+            "question_id",
+            "question_version",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+    @property
+    def question_key(self) -> str:
+        return f"{self.question_id}@v{self.question_version}"

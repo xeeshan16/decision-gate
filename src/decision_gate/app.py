@@ -19,13 +19,28 @@ from decision_gate.backends import DecisionBackend
 from decision_gate.backends.base import BackendError
 from decision_gate.backends.factory import build_backend
 from decision_gate.calibration import CalibrationReport, GroupField, build_reports
+from decision_gate.calibrators import CalibrationError
 from decision_gate.catalog import load_catalog
 from decision_gate.config import Settings
 from decision_gate.db import make_engine, make_sessionmaker
-from decision_gate.db.models import DecisionRecord, OutcomeRecord
-from decision_gate.db.repository import DecisionRepository, LabelStats, OutcomeRepository
+from decision_gate.db.models import CalibratorRecord, DecisionRecord, OutcomeRecord
+from decision_gate.db.repository import (
+    ActivationConflictError,
+    CalibratorRepository,
+    DecisionRepository,
+    LabelStats,
+    OutcomeRepository,
+)
 from decision_gate.metrics import BinStrategy, ReliabilityBin
 from decision_gate.questions import Answer, QuestionCatalog
+from decision_gate.refit import (
+    DEFAULT_HOLDOUT,
+    DEFAULT_MIN_COUNT,
+    MethodChoice,
+    RefitJob,
+    RefitOutcome,
+    RefitResult,
+)
 from decision_gate.service import (
     BackendTimeoutError,
     DecisionService,
@@ -218,6 +233,88 @@ class CalibrationMetricsOut(BaseModel):
     reports: list[CalibrationReportOut]
 
 
+CalibratorStatus = Literal["active", "candidate", "rejected", "retired"]
+
+
+class CalibratorOut(BaseModel):
+    id: uuid.UUID
+    question: str
+    question_version: int
+    version: int = Field(description="Fit number within this question version (1, 2, ...).")
+    method: str
+    params: dict[str, Any]
+    status: CalibratorStatus
+    reason: str
+    train_count: int
+    holdout_count: int
+    trained_from: datetime | None
+    trained_until: datetime | None
+    evaluation: dict[str, Any] = Field(
+        description="Held-out metrics for the raw scores, every candidate and the incumbent."
+    )
+    created_at: datetime
+    activated_at: datetime | None
+
+    @classmethod
+    def from_record(cls, record: CalibratorRecord) -> CalibratorOut:
+        return cls(
+            id=record.id,
+            question=record.question_id,
+            question_version=record.question_version,
+            version=record.version,
+            method=record.method,
+            params=record.params,
+            status=record.status,
+            reason=record.reason,
+            train_count=record.train_count,
+            holdout_count=record.holdout_count,
+            trained_from=_utc(record.trained_from) if record.trained_from else None,
+            trained_until=_utc(record.trained_until) if record.trained_until else None,
+            evaluation=record.evaluation,
+            created_at=_utc(record.created_at),
+            activated_at=_utc(record.activated_at) if record.activated_at else None,
+        )
+
+
+class RefitIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    version: int | None = Field(default=None, ge=1, description="Defaults to the latest.")
+    method: MethodChoice = Field(
+        default="auto", description="'auto' tries every method that fits the data."
+    )
+    holdout: float = Field(
+        default=DEFAULT_HOLDOUT, gt=0, lt=1, description="Newest fraction held out."
+    )
+    min_count: int = Field(default=DEFAULT_MIN_COUNT, ge=2, le=1_000_000)
+    since: datetime | None = None
+    until: datetime | None = None
+    activate: bool = Field(
+        default=True, description="Activate the new fit if it beats raw and the active one."
+    )
+
+
+class RefitOut(BaseModel):
+    question: str
+    question_version: int
+    outcome: RefitOutcome
+    reason: str
+    labeled: int
+    calibrator: CalibratorOut | None
+
+    @classmethod
+    def from_result(cls, result: RefitResult) -> RefitOut:
+        return cls(
+            question=result.question_id,
+            question_version=result.question_version,
+            outcome=result.outcome,
+            reason=result.reason,
+            labeled=result.labeled,
+            calibrator=CalibratorOut.from_record(result.record) if result.record else None,
+        )
+
+
 class DecisionOut(BaseModel):
     id: uuid.UUID
     question: str
@@ -272,6 +369,8 @@ def create_app(
     repository = DecisionRepository(sessions)
     outcome_repository = OutcomeRepository(sessions)
     outcome_service = OutcomeService(catalog, repository, outcome_repository)
+    calibrator_repository = CalibratorRepository(sessions)
+    refit_job = RefitJob(outcome_repository, calibrator_repository)
     service = DecisionService(
         backend,
         repository,
@@ -480,5 +579,79 @@ def create_app(
             group_by=fields,
             reports=[CalibrationReportOut.from_report(r) for r in reports],
         )
+
+    @app.post(
+        "/v1/calibrators/refit",
+        tags=["calibrators"],
+        responses={
+            404: {"description": "Unknown question."},
+            422: {"description": "Invalid options, e.g. temperature on a score question."},
+        },
+    )
+    async def refit_calibrator(request: RefitIn) -> RefitOut:
+        """Fit calibrators on labeled decisions and activate the best one if it helps.
+
+        The newest ``holdout`` fraction of labeled decisions is held out. The best method
+        by held-out log loss is stored as a new version; it is activated only if it beats
+        both the raw confidences and the active calibrator on that held-out data.
+        """
+        version = request.version
+        if version is None:
+            try:
+                version = catalog.get(request.question).version
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        try:
+            result = await refit_job.refit(
+                request.question,
+                version,
+                method=request.method,
+                holdout=request.holdout,
+                min_count=request.min_count,
+                since=request.since,
+                until=request.until,
+                activate=request.activate,
+            )
+        except CalibrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return RefitOut.from_result(result)
+
+    @app.get("/v1/calibrators", tags=["calibrators"])
+    async def list_calibrators(
+        question: str | None = None,
+        version: Annotated[int | None, Query(ge=1)] = None,
+        status: CalibratorStatus | None = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ) -> dict[str, list[CalibratorOut]]:
+        """The calibrator registry, newest fit first within each question version."""
+        records = await calibrator_repository.find(
+            question_id=question, question_version=version, status=status, limit=limit
+        )
+        return {"calibrators": [CalibratorOut.from_record(r) for r in records]}
+
+    @app.get("/v1/calibrators/{calibrator_id}", tags=["calibrators"])
+    async def get_calibrator(calibrator_id: uuid.UUID) -> CalibratorOut:
+        record = await calibrator_repository.get(calibrator_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown calibrator")
+        return CalibratorOut.from_record(record)
+
+    @app.post(
+        "/v1/calibrators/{calibrator_id}/activate",
+        tags=["calibrators"],
+        responses={
+            404: {"description": "Unknown calibrator."},
+            409: {"description": "A concurrent activation won."},
+        },
+    )
+    async def activate_calibrator(calibrator_id: uuid.UUID) -> CalibratorOut:
+        """Make this calibrator the active one, e.g. to roll back. Retires the current one."""
+        try:
+            record = await calibrator_repository.activate(calibrator_id)
+        except ActivationConflictError as exc:  # pragma: no cover - needs an exact race
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown calibrator")
+        return CalibratorOut.from_record(record)
 
     return app

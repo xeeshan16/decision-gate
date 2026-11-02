@@ -102,3 +102,10 @@ jobs:
           curl -sf 'localhost:8080/v1/calibration/metrics?bins=5' \
             | jq -e '.reports[0].count == 1 and (.reports[0].bins | length) == 5'
           .venv/bin/dgate calibration report --bins 5 --show-bins
+          # The refit job runs against the calibrator registry: one label is below
+          # min_count, so it is skipped and nothing is stored.
+          curl -sf -X POST localhost:8080/v1/calibrators/refit \
+            -H 'content-type: application/json' -d '{"question": "ticket.queue", "min_count": 2}' \
+            | jq -e '.outcome == "skipped" and .labeled == 1'
+          .venv/bin/dgate calibrators refit --all --min-count 2 | grep -q skipped
+          curl -sf localhost:8080/v1/calibrators | jq -e '.calibrators == []'

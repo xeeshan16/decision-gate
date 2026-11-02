@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from decision_gate.db.models import DecisionRecord, OutcomeRecord
+from decision_gate.db.models import CalibratorRecord, DecisionRecord, OutcomeRecord
 
 
 class DecisionRepository:
@@ -84,6 +84,9 @@ class LabeledRow:
     correct: bool
     probabilities: dict[str, float] | None
     outcome: Any
+    answer: Any = None
+    created_at: datetime | None = None
+    """Decision time, so jobs can split labeled data chronologically."""
 
 
 class OutcomeRepository:
@@ -169,6 +172,8 @@ class OutcomeRepository:
                 OutcomeRecord.correct,
                 DecisionRecord.probabilities,
                 OutcomeRecord.outcome,
+                DecisionRecord.answer,
+                DecisionRecord.created_at,
             )
             .join(OutcomeRecord, OutcomeRecord.decision_id == DecisionRecord.id)
             .order_by(
@@ -198,6 +203,8 @@ class OutcomeRepository:
                     correct=bool(correct),
                     probabilities=probabilities,
                     outcome=outcome,
+                    answer=answer,
+                    created_at=created_at,
                 )
                 for (
                     qid,
@@ -208,6 +215,8 @@ class OutcomeRepository:
                     correct,
                     probabilities,
                     outcome,
+                    answer,
+                    created_at,
                 ) in result.all()
             ]
 
@@ -242,3 +251,128 @@ class OutcomeRepository:
                 )
                 for qid, version, decisions, n_labeled, n_correct, mean_conf in result.all()
             ]
+
+
+class ActivationConflictError(RuntimeError):
+    """Another activation for the same question version won a concurrent race."""
+
+
+class CalibratorRepository:
+    """The versioned calibrator registry."""
+
+    MAX_VERSION_ATTEMPTS = 5
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def get(self, calibrator_id: uuid.UUID) -> CalibratorRecord | None:
+        async with self._sessions() as session:
+            return await session.get(CalibratorRecord, calibrator_id)
+
+    async def active(self, question_id: str, question_version: int) -> CalibratorRecord | None:
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(CalibratorRecord).where(
+                    CalibratorRecord.question_id == question_id,
+                    CalibratorRecord.question_version == question_version,
+                    CalibratorRecord.status == "active",
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def find(
+        self,
+        *,
+        question_id: str | None = None,
+        question_version: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[CalibratorRecord]:
+        """Newest version first within each question version."""
+        query = (
+            select(CalibratorRecord)
+            .order_by(
+                CalibratorRecord.question_id,
+                CalibratorRecord.question_version,
+                CalibratorRecord.version.desc(),
+            )
+            .limit(limit)
+        )
+        if question_id is not None:
+            query = query.where(CalibratorRecord.question_id == question_id)
+        if question_version is not None:
+            query = query.where(CalibratorRecord.question_version == question_version)
+        if status is not None:
+            query = query.where(CalibratorRecord.status == status)
+        async with self._sessions() as session:
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def add(self, record: CalibratorRecord) -> CalibratorRecord:
+        """Store a new fit with the next version number for its question version.
+
+        If ``record.status`` is ``active``, the current active calibrator is retired in
+        the same transaction. Version numbers are taken as ``max + 1``; when two fits race
+        for the same number the unique constraint rejects one, which retries.
+        """
+        for _attempt in range(self.MAX_VERSION_ATTEMPTS):
+            async with self._sessions() as session:
+                latest = await session.scalar(
+                    select(func.max(CalibratorRecord.version)).where(
+                        CalibratorRecord.question_id == record.question_id,
+                        CalibratorRecord.question_version == record.question_version,
+                    )
+                )
+                record.version = int(latest or 0) + 1
+                if record.status == "active":
+                    record.activated_at = datetime.now(UTC)
+                    await self._retire_active(session, record.question_id, record.question_version)
+                session.add(record)
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    # The rolled-back record is transient again and is re-added next try.
+                    await session.rollback()
+                    continue
+                return record
+        raise ActivationConflictError(  # pragma: no cover - needs repeated lost races
+            f"could not store a calibrator for {record.question_key} after "
+            f"{self.MAX_VERSION_ATTEMPTS} attempts (concurrent fits)"
+        )
+
+    async def activate(self, calibrator_id: uuid.UUID) -> CalibratorRecord | None:
+        """Make one stored calibrator the active one for its question version.
+
+        Works for any status, so an operator can roll back to an older calibrator.
+        Returns ``None`` for an unknown id.
+        """
+        async with self._sessions() as session:
+            record = await session.get(CalibratorRecord, calibrator_id)
+            if record is None:
+                return None
+            if record.status == "active":
+                return record
+            await self._retire_active(session, record.question_id, record.question_version)
+            record.status = "active"
+            record.activated_at = datetime.now(UTC)
+            try:
+                await session.commit()
+            except IntegrityError as exc:  # pragma: no cover - needs an exact race
+                await session.rollback()
+                raise ActivationConflictError(
+                    f"another calibrator for {record.question_key} was activated concurrently"
+                ) from exc
+            return record
+
+    @staticmethod
+    async def _retire_active(session: AsyncSession, question_id: str, version: int) -> None:
+        await session.execute(
+            update(CalibratorRecord)
+            .where(
+                CalibratorRecord.question_id == question_id,
+                CalibratorRecord.question_version == version,
+                CalibratorRecord.status == "active",
+            )
+            .values(status="retired")
+        )
+        await session.flush()
