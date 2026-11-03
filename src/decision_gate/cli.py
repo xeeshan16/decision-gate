@@ -42,6 +42,14 @@ calibrators_app = typer.Typer(
     help="Fit, list and activate calibrators (the versioned registry).", no_args_is_help=True
 )
 app.add_typer(calibrators_app, name="calibrators")
+thresholds_app = typer.Typer(
+    help="Select automation thresholds with statistical guarantees.", no_args_is_help=True
+)
+app.add_typer(thresholds_app, name="thresholds")
+conformal_app = typer.Typer(
+    help="Calibrate conformal prediction sets for choice questions.", no_args_is_help=True
+)
+app.add_typer(conformal_app, name="conformal")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -707,3 +715,313 @@ def calibrators_activate(
         typer.echo("error: unknown calibrator", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"activated {record.question_key} v{record.version} ({record.method}) {record.id}")
+
+
+async def _with_analyzer(database_url: str, work: Any) -> Any:
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import CalibratorRepository, OutcomeRepository
+    from decision_gate.selection import GateAnalyzer
+
+    engine = make_engine(database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        analyzer = GateAnalyzer(OutcomeRepository(sessions), CalibratorRepository(sessions))
+        return await work(analyzer)
+    finally:
+        await engine.dispose()
+
+
+def _question(question_id: str, version: int | None, questions: Path | None) -> Any:
+    catalog = _catalog_for_ingest(questions)
+    try:
+        return catalog.get(question_id, version)
+    except KeyError as exc:
+        typer.echo(f"error: {exc.args[0]}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+HoldoutOption = Annotated[
+    float, typer.Option(min=0.0, max=0.95, help="Newest fraction held out to check the result.")
+]
+SinceOption = Annotated[
+    datetime | None, typer.Option(help="Decisions made at or after this time (UTC).")
+]
+UntilOption = Annotated[
+    datetime | None, typer.Option(help="Decisions made before this time (UTC).")
+]
+CalibratorOption = Annotated[
+    bool,
+    typer.Option("--calibrator/--raw", help="Score with the active calibrator, or raw scores."),
+]
+
+
+def _basis_line(basis: Any) -> str:
+    line = (
+        f"{basis.question_key}: {basis.labeled} labeled, scores from {basis.score_source}; "
+        f"{basis.selection_count} used, {basis.holdout_count} held out"
+    )
+    if basis.excluded_training:
+        line += f", {basis.excluded_training} skipped (calibrator training data)"
+    return line
+
+
+@thresholds_app.command("select")
+def thresholds_select(
+    question: Annotated[str, typer.Argument(help="Question id.")],
+    version: Annotated[
+        int | None, typer.Option(min=1, help="Question version (default: latest in catalog).")
+    ] = None,
+    target_precision: Annotated[
+        float | None,
+        typer.Option(min=0.0, max=1.0, help="Minimum precision of automated decisions."),
+    ] = None,
+    max_error_rate: Annotated[
+        float | None, typer.Option(min=0.0, max=1.0, help="Alternative: 1 - precision.")
+    ] = None,
+    confidence: Annotated[float, typer.Option(min=0.5, max=0.9999)] = 0.95,
+    bound: Annotated[str, typer.Option(help="clopper-pearson or wilson.")] = "clopper-pearson",
+    min_accepted: Annotated[
+        int, typer.Option(min=1, help="Fewest decisions a candidate must accept.")
+    ] = 100,
+    holdout: HoldoutOption = 0.3,
+    since: SinceOption = None,
+    until: UntilOption = None,
+    use_calibrator: CalibratorOption = True,
+    curve_points: Annotated[
+        int, typer.Option("--curve", min=0, help="Curve rows to show (JSON: 10 by default).")
+    ] = 0,
+    questions: OptionalCatalogPath = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead.")] = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Pick the lowest threshold whose precision meets the target with confidence."""
+    from pydantic import ValidationError
+
+    from decision_gate.gating_api import ThresholdOut, ThresholdSelectIn
+    from decision_gate.selection import SelectionError
+
+    try:
+        request = ThresholdSelectIn(
+            question=question,
+            version=version,
+            target_precision=target_precision,
+            max_error_rate=max_error_rate,
+            confidence=confidence,
+            bound=bound,
+            min_accepted=min_accepted,
+            holdout=holdout,
+            since=_as_utc(since),
+            until=_as_utc(until),
+            use_calibrator=use_calibrator,
+            curve_points=(curve_points or 10) if as_json else curve_points,
+        )
+    except ValidationError as exc:
+        typer.echo(f"error: {exc.errors()[0]['msg']}", err=True)
+        raise typer.Exit(code=2) from exc
+    target = _question(question, version, questions)
+
+    async def work(analyzer: Any) -> Any:
+        return await analyzer.thresholds(
+            target,
+            target_precision=request.target,
+            confidence=request.confidence,
+            bound=request.bound,
+            min_accepted=request.min_accepted,
+            holdout=request.holdout,
+            since=request.since,
+            until=request.until,
+            use_calibrator=request.use_calibrator,
+        )
+
+    try:
+        report = asyncio.run(_with_analyzer(_database_url(url), work))
+    except SelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    out = ThresholdOut.from_report(report, request)
+    if as_json:
+        typer.echo(out.model_dump_json(indent=2))
+        return
+    typer.echo(_basis_line(report.basis))
+    typer.echo(out.reason)
+    if out.holdout is not None:
+        precision = _fmt(out.holdout.precision, ".4f")
+        typer.echo(
+            f"held out: {out.holdout.accepted}/{out.holdout.total} accepted "
+            f"({out.holdout.coverage:.1%}), precision {precision}"
+        )
+    if out.curve:
+        typer.echo(
+            f"{'threshold':>10} {'accepted':>9} {'coverage':>9} {'precision':>10} {'bound':>8}"
+        )
+        for p in out.curve:
+            mark = "  <- selected" if out.selected and p.threshold == out.selected.threshold else ""
+            typer.echo(
+                f"{p.threshold:>10.4f} {p.accepted:>9} {p.coverage:>9.1%} "
+                f"{p.precision:>10.4f} {p.lower_bound:>8.4f}{mark}"
+            )
+
+
+@conformal_app.command("fit")
+def conformal_fit(
+    question: Annotated[str, typer.Argument(help="Question id (choice or predicate).")],
+    version: Annotated[
+        int | None, typer.Option(min=1, help="Question version (default: latest in catalog).")
+    ] = None,
+    alpha: Annotated[float, typer.Option(min=0.001, max=0.999, help="Allowed miss rate.")] = 0.1,
+    method: Annotated[str, typer.Option(help="lac or aps.")] = "lac",
+    holdout: HoldoutOption = 0.3,
+    since: SinceOption = None,
+    until: UntilOption = None,
+    use_calibrator: CalibratorOption = True,
+    questions: OptionalCatalogPath = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead.")] = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Calibrate prediction sets that contain the true label with probability >= 1 - alpha."""
+    from pydantic import ValidationError
+
+    from decision_gate.gating_api import ConformalFitIn, ConformalOut
+    from decision_gate.selection import SelectionError
+
+    try:
+        request = ConformalFitIn(
+            question=question,
+            version=version,
+            alpha=alpha,
+            method=method,
+            holdout=holdout,
+            since=_as_utc(since),
+            until=_as_utc(until),
+            use_calibrator=use_calibrator,
+        )
+    except ValidationError as exc:
+        typer.echo(f"error: {exc.errors()[0]['msg']}", err=True)
+        raise typer.Exit(code=2) from exc
+    target = _question(question, version, questions)
+
+    async def work(analyzer: Any) -> Any:
+        return await analyzer.conformal(
+            target,
+            alpha=request.alpha,
+            method=request.method,
+            holdout=request.holdout,
+            since=request.since,
+            until=request.until,
+            use_calibrator=request.use_calibrator,
+        )
+
+    try:
+        report = asyncio.run(_with_analyzer(_database_url(url), work))
+    except SelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    out = ConformalOut.from_report(report, request)
+    if as_json:
+        typer.echo(out.model_dump_json(indent=2))
+        return
+    typer.echo(_basis_line(report.basis))
+    typer.echo(out.reason)
+    if out.holdout is not None:
+        h = out.holdout
+        sizes = " ".join(f"{size}:{count}" for size, count in h.size_counts.items())
+        typer.echo(
+            f"held out: coverage {h.coverage:.3f} (target {out.target_coverage:.3f}), "
+            f"mean set size {h.mean_size:.2f}, singletons {h.singleton_rate:.1%} "
+            f"(accuracy {_fmt(h.singleton_accuracy)}), empty {h.empty_rate:.1%}; sizes {sizes}"
+        )
+
+
+@app.command("fake-gate")
+def fake_gate(
+    questions: CatalogPath,
+    samples: Annotated[
+        int, typer.Option("--samples", "-n", min=100, help="Inputs per question.")
+    ] = 6000,
+    overconfidence: Annotated[
+        float, typer.Option(help="Fake backend overconfidence (1.0 = calibrated).")
+    ] = 2.0,
+    target_precision: Annotated[float, typer.Option(min=0.5, max=0.999)] = 0.95,
+    alpha: Annotated[float, typer.Option(min=0.01, max=0.5)] = 0.1,
+) -> None:
+    """Thresholds and conformal sets on the fake backend, with no database.
+
+    Inputs are split in order: 40% fit a calibrator (temperature scaling when the backend
+    returns distributions, Platt otherwise), 30% select the threshold and calibrate the
+    conformal quantile, and the last 30% check what they achieve.
+    """
+    try:
+        catalog = load_catalog(questions)
+    except CatalogError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    import numpy as np
+
+    from decision_gate.backends.base import answer_key
+    from decision_gate.calibrators import Method, fit_calibrator
+    from decision_gate.conformal import distribution_matrix, evaluate, fit_conformal
+    from decision_gate.db.repository import LabeledRow
+    from decision_gate.questions import ChoiceQuestion, ScoreQuestion
+    from decision_gate.refit import calibration_data
+    from decision_gate.selection import calibrated_distributions
+    from decision_gate.thresholds import apply_threshold, select_threshold
+
+    backend = FakeBackend(overconfidence=overconfidence)
+    a, b = int(samples * 0.4), int(samples * 0.7)
+    for question in catalog.questions:
+        rows: list[LabeledRow] = []
+        for i in range(samples):
+            data = {"item": i}
+            decision = backend.decide_sync(question, data)
+            truth = hash_oracle(question, data)
+            rows.append(
+                LabeledRow(
+                    question_id=question.id,
+                    question_version=question.version,
+                    backend=decision.backend,
+                    model_version=decision.model_version,
+                    confidence=decision.confidence,
+                    correct=question.is_correct(decision.answer, truth),
+                    probabilities=decision.probabilities,
+                    outcome=truth,
+                    answer=decision.answer,
+                )
+            )
+        everything = calibration_data(rows)
+        train = everything.subset(slice(0, a))
+        method: Method = "temperature" if train.has_distributions else "platt"
+        calibrator = fit_calibrator(method, train)
+        typer.echo(f"{question.key}  (calibrator: {method}, target precision {target_precision})")
+        for name, scores in (
+            ("raw", everything.confidences),
+            ("calibrated", calibrator.predict(everything)),
+        ):
+            selection = select_threshold(
+                scores[a:b], everything.correct[a:b], target_precision=target_precision
+            )
+            if selection.threshold is None:
+                typer.echo(f"  {name:<11} no threshold: {selection.reason}")
+                continue
+            check = apply_threshold(selection.threshold, scores[b:], everything.correct[b:])
+            typer.echo(
+                f"  {name:<11} threshold {selection.threshold:.4f}  "
+                f"selection: {selection.selected.coverage:.1%} automated, "  # type: ignore[union-attr]
+                f"bound {selection.selected.lower_bound:.4f}  "  # type: ignore[union-attr]
+                f"check: {check.coverage:.1%} automated, precision {_fmt(check.precision, '.4f')}"
+            )
+        if isinstance(question, ScoreQuestion):
+            continue
+        labels = question.options if isinstance(question, ChoiceQuestion) else ("false", "true")
+        index = {label: i for i, label in enumerate(labels)}
+        matrix = distribution_matrix(calibrated_distributions(rows, calibrator), labels)
+        truths = np.array([index[answer_key(row.outcome)] for row in rows], dtype=np.intp)
+        for conformal_method in ("lac", "aps"):
+            predictor = fit_conformal(
+                matrix[a:b], truths[a:b], labels, alpha=alpha, method=conformal_method
+            )
+            result = evaluate(predictor, matrix[b:], truths[b:])
+            typer.echo(
+                f"  {conformal_method:<11} sets for {1 - alpha:.0%} coverage: "
+                f"quantile {predictor.quantile:.4f}  check: coverage {result.coverage:.3f}, "
+                f"mean size {result.mean_size:.2f}, singletons {result.singleton_rate:.1%}"
+            )

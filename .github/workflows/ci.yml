@@ -69,6 +69,7 @@ jobs:
         run: |
           uv run dgate questions check examples/questions.yaml
           uv run dgate ask refund.eligible -q examples/questions.yaml -i '{"order_age_days": 12}'
+          uv run dgate fake-gate -q examples/questions.yaml -n 2000 --target-precision 0.9
 
       - name: Smoke test the API against PostgreSQL
         env:
@@ -109,3 +110,14 @@ jobs:
             | jq -e '.outcome == "skipped" and .labeled == 1'
           .venv/bin/dgate calibrators refit --all --min-count 2 | grep -q skipped
           curl -sf localhost:8080/v1/calibrators | jq -e '.calibrators == []'
+          # Threshold selection and conformal sets read the same single label: too few to
+          # automate anything, and too few for a finite conformal quantile.
+          curl -sf -X POST localhost:8080/v1/thresholds/select \
+            -H 'content-type: application/json' \
+            -d '{"question": "ticket.queue", "min_accepted": 1, "holdout": 0}' \
+            | jq -e '.basis.labeled == 1 and .threshold == null and .tested == 1'
+          curl -sf -X POST localhost:8080/v1/conformal/fit \
+            -H 'content-type: application/json' -d '{"question": "ticket.queue", "holdout": 0}' \
+            | jq -e '.trivial == true and .calibration_count == 1'
+          .venv/bin/dgate thresholds select ticket.queue --min-accepted 1 --holdout 0
+          .venv/bin/dgate conformal fit ticket.queue --holdout 0 | grep -q "every label"

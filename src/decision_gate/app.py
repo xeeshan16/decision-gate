@@ -31,6 +31,7 @@ from decision_gate.db.repository import (
     LabelStats,
     OutcomeRepository,
 )
+from decision_gate.gating_api import gating_router
 from decision_gate.metrics import BinStrategy, ReliabilityBin
 from decision_gate.questions import Answer, QuestionCatalog
 from decision_gate.refit import (
@@ -41,6 +42,7 @@ from decision_gate.refit import (
     RefitOutcome,
     RefitResult,
 )
+from decision_gate.selection import GateAnalyzer
 from decision_gate.service import (
     BackendTimeoutError,
     DecisionService,
@@ -654,4 +656,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown calibrator")
         return CalibratorOut.from_record(record)
 
+    app.include_router(
+        gating_router(catalog, GateAnalyzer(outcome_repository, calibrator_repository))
+    )
     return app
