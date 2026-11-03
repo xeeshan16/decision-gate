@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 5 of a 14-day build). See
+> **Status:** under active development (day 6 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -44,7 +44,7 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Streaming outcome ingestion: JSON Lines CLI and an optional Kafka consumer with a dead-letter topic | ✅ day 3 |
 | Calibration metrics: ECE (with a bootstrap interval), MCE, Brier, log loss, multi-class scores and reliability bins, per question version, backend and model | ✅ day 4 |
 | Platt, isotonic and temperature calibrators, a versioned calibrator registry and a refit job that promotes a fit only if it wins on held-out decisions | ✅ day 5 |
-| Thresholds with Wilson/Clopper-Pearson bounds, conformal sets | planned (day 6) |
+| Automation thresholds that meet a precision target with Clopper-Pearson or Wilson bounds (fixed-sequence testing), and split-conformal prediction sets (LAC, APS) for choice and predicate questions | ✅ day 6 |
 | Per-question routing policy and human review queue | planned (days 7-8) |
 | Drift detection, shadow mode, simulator, observability | planned (days 9-12) |
 
@@ -370,6 +370,144 @@ runs. Hand-worked fixtures, optimality checks and recovery of known distortions 
 [tests/test_calibrators.py](tests/test_calibrators.py). Calibrated probabilities are not yet applied to `/v1/decide` responses; that comes
 with the routing tiers on day 7.
 
+### Thresholds and conformal sets
+
+A calibrated probability says how often a decision like this one is right. The routing
+question is different: *from which score up can decisions be automated, so that the
+automated ones are right at least 95% of the time, and how sure are we of that?*
+
+**Threshold selection** (`POST /v1/thresholds/select`, `dgate thresholds select`) answers
+it with a statistical guarantee, implemented from scratch in
+[bounds.py](src/decision_gate/bounds.py) and [thresholds.py](src/decision_gate/thresholds.py):
+
+- A decision is accepted when its score is at least the threshold. For each candidate
+  threshold, `k` of the `n` accepted decisions were correct, and a one-sided lower
+  confidence bound on that proportion is computed: **Clopper-Pearson** (exact, from the
+  beta quantile, never below its nominal coverage) by default, or **Wilson** (closed form,
+  tighter, but its coverage dips below nominal for some proportions, which a test
+  demonstrates).
+- Picking "the lowest threshold whose bound clears the target" after looking at all of
+  them would be cherry-picking. Candidates are instead tested as a **fixed sequence**, from
+  the highest threshold down, and the search stops at the first one whose bound misses
+  the target. The order depends only on the scores, never on the labels, so the
+  family-wise error stays at `1 - confidence` with no multiplicity correction.
+- The guarantee: if the labeled decisions are representative (i.i.d.) of the traffic the
+  threshold will run on, then with probability at least `confidence` the automated
+  decisions have precision at least `target_precision`. Drift breaks that assumption;
+  detecting it is day 9.
+- `min_accepted` (default 100) is the smallest group a candidate may accept. It also sets
+  where the sequence starts: starting on 30 decisions, a single error (29/30, bound 0.85)
+  would end the search with nothing selected.
+
+**Conformal prediction sets** (`POST /v1/conformal/fit`, `dgate conformal fit`,
+[conformal.py](src/decision_gate/conformal.py)) cover the other case: instead of one answer,
+return a set of labels that contains the true one with probability at least `1 - alpha`,
+however miscalibrated the model is. The quantile is the `ceil((n + 1)(1 - alpha))`-th
+smallest nonconformity score of `n` calibration decisions (too few decisions gives an
+infinite quantile: every label is in every set, and the response says so).
+
+| Score | Nonconformity of label `y` | Behaviour |
+| --- | --- | --- |
+| `lac` (default) | `1 - p(y)` | Smallest sets on average. Can be empty when the model is unsure of everything, which routing treats as "send to a human". |
+| `aps` | `p(y)` plus the mass of every more probable label | Sets adapt to difficulty and always include the top label. Larger on average, and of little use for two-label (predicate) questions, where it tends to return both labels. |
+
+A singleton set is a confident answer; a larger set narrows down what a reviewer has to
+consider. Both feed the routing policy on day 7.
+
+Both analyses score decisions with the **active calibrator** (`use_calibrator`, default
+true) and skip the decisions it was trained on, since a score function evaluated on its
+own training data looks better than it is. The remaining decisions are split by time: the
+older 70% select the threshold (or calibrate the quantile) and the newest 30% (`holdout`)
+check what it actually achieves. Only temperature scaling changes the distributions that
+conformal sets use; Platt and isotonic recalibrate just the decided answer.
+
+Real output, from 3,000 labeled decisions per question from the overconfident fake
+(`overconfidence=2.0`), recorded through the API into PostgreSQL 16, after
+`dgate calibrators refit --all` activated temperature scaling (`refund.eligible`,
+`ticket.queue`) and Platt scaling (`ticket.handling_minutes`):
+
+```console
+$ uv run dgate thresholds select refund.eligible --target-precision 0.9 --curve 6
+refund.eligible@v1: 3000 labeled, scores from calibrator v1 (temperature); 630 used, 270 held out, 2100 skipped (calibrator training data)
+accept score >= 0.8668: 24.4% of decisions, precision 0.9481 (146/154), 95% lower bound 0.9082 >= target 0.9000; the next candidate 0.8613 failed
+held out: 63/270 accepted (23.3%), precision 0.9048
+ threshold  accepted  coverage  precision    bound
+    0.9049       100     15.9%     0.9800   0.9384
+    0.8668       154     24.4%     0.9481   0.9082  <- selected
+    0.8613       159     25.2%     0.9371   0.8957
+    0.8189       207     32.9%     0.9179   0.8794
+    0.7391       314     49.8%     0.8599   0.8235
+    0.6655       416     66.0%     0.8221   0.7884
+    0.5898       523     83.0%     0.7801   0.7482
+    0.5024       630    100.0%     0.7556   0.7257
+$ uv run dgate thresholds select ticket.queue --target-precision 0.9
+ticket.queue@v1: 3000 labeled, scores from calibrator v1 (temperature); 630 used, 270 held out, 2100 skipped (calibrator training data)
+even the highest threshold 0.8678 has a 95% lower bound of 0.8482 on precision (91/100), below the target 0.9000
+$ uv run dgate thresholds select ticket.queue --target-precision 0.9 --raw
+ticket.queue@v1: 3000 labeled, scores from raw; 2100 used, 900 held out
+accept score >= 0.9916: 19.2% of decisions, precision 0.9330 (376/403), 95% lower bound 0.9088 >= target 0.9000; the next candidate 0.9907 failed
+held out: 169/900 accepted (18.8%), precision 0.9290
+$ uv run dgate conformal fit refund.eligible --alpha 0.1
+refund.eligible@v1: 3000 labeled, scores from calibrator v1 (temperature); 630 used, 270 held out, 2100 skipped (calibrator training data)
+lac sets with quantile 0.6960 cover the true label with probability >= 90%
+held out: coverage 0.904 (target 0.900), mean set size 1.43, singletons 56.7% (accuracy 0.830), empty 0.0%; sizes 1:153 2:117
+$ uv run dgate conformal fit ticket.queue --alpha 0.1
+ticket.queue@v1: 3000 labeled, scores from calibrator v1 (temperature); 630 used, 270 held out, 2100 skipped (calibrator training data)
+lac sets with quantile 0.8914 cover the true label with probability >= 90%
+held out: coverage 0.859 (target 0.900), mean set size 2.78, singletons 55.6% (accuracy 0.747), empty 0.0%; sizes 1:150 5:120
+```
+
+What this shows, warts included:
+
+- For `refund.eligible` the calibrated scores now read as probabilities: automate at 0.87
+  rather than at a raw 0.99-something. On the held-out decisions the threshold automated
+  23% of traffic at precision 0.905, just above the 0.9 target.
+- For `ticket.queue`, skipping the calibrator's 2,100 training decisions leaves 630 to
+  select on, too few to prove 90% precision; on raw scores, with all 2,100 older
+  decisions, the same target is met at 19% automation. Excluding training data is the
+  cautious choice for any calibrator, but for a strictly increasing one (Platt, or
+  temperature scaling on the fake's distributions, where the other options share the
+  remaining probability equally) the accepted sets are exactly those of the raw scores, so
+  the exclusion costs power without buying validity. Using all decisions when
+  the calibrator is strictly increasing is on the list for day 7.
+- The `ticket.queue` held-out coverage of 0.859 is below the 0.9 target. The guarantee is
+  on average over calibration sets; with 630 calibration and 270 held-out decisions the
+  standard deviation of this number is about 0.02, so this run is roughly two standard
+  deviations low. The test suite checks the average over 150 synthetic runs instead
+  ([tests/test_conformal.py](tests/test_conformal.py)). Sets are size 1 or 5 because the
+  fake spreads the remaining probability evenly over the other options.
+
+`dgate fake-gate` runs the whole pipeline without a database: on 6,000 fresh fake decisions
+per question, 40% fit the calibrator, 30% select and 30% check.
+
+```console
+$ uv run dgate fake-gate -q examples/questions.yaml --target-precision 0.9
+refund.eligible@v1  (calibrator: temperature, target precision 0.9)
+  raw         threshold 0.9664  selection: 29.4% automated, bound 0.9027  check: 32.5% automated, precision 0.9385
+  calibrated  threshold 0.8341  selection: 29.4% automated, bound 0.9027  check: 32.5% automated, precision 0.9385
+  lac         sets for 90% coverage: quantile 0.6842  check: coverage 0.896, mean size 1.36, singletons 63.7%
+  aps         sets for 90% coverage: quantile 1.0000  check: coverage 1.000, mean size 2.00, singletons 0.0%
+ticket.queue@v1  (calibrator: temperature, target precision 0.9)
+  raw         threshold 0.9966  selection: 14.2% automated, bound 0.9017  check: 13.0% automated, precision 0.9487
+  calibrated  threshold 0.8896  selection: 14.2% automated, bound 0.9017  check: 13.0% automated, precision 0.9487
+  lac         sets for 90% coverage: quantile 0.8974  check: coverage 0.909, mean size 3.07, singletons 48.2%
+  aps         sets for 90% coverage: quantile 0.9196  check: coverage 0.993, mean size 4.50, singletons 12.5%
+ticket.handling_minutes@v1  (calibrator: platt, target precision 0.9)
+  raw         no threshold: even the highest threshold 0.9989 has a 95% lower bound of 0.8725 on precision (93/100), below the target 0.9000
+  calibrated  no threshold: even the highest threshold 0.9744 has a 95% lower bound of 0.8725 on precision (93/100), below the target 0.9000
+```
+
+Raw and calibrated rows select the same decisions because both calibrators here are
+strictly increasing; calibration changes what the threshold *means*, not the ranking.
+
+Threshold options: `question`, `version`, `target_precision` (default 0.95) or
+`max_error_rate`, `confidence` (0.95), `bound` (`clopper-pearson`, `wilson`),
+`min_accepted` (100), `holdout` (0.3), `since`/`until`, `use_calibrator` (true) and
+`curve_points` (10). Conformal options: `question`, `version`, `alpha` (0.1), `method`
+(`lac`, `aps`), `holdout`, `since`/`until` and `use_calibrator`; the response includes the
+`params` needed to rebuild the predictor. Neither result is stored yet: the routing policy
+(day 7) will persist the threshold and quantile it acts on.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -386,6 +524,8 @@ with the routing tiers on day 7.
 | `POST /v1/calibrators/refit` | Fit calibrators on labeled decisions and activate the best if it wins on held-out data. `404` unknown question, `422` invalid options (e.g. `temperature` on a score question) |
 | `GET /v1/calibrators`, `GET /v1/calibrators/{id}` | The calibrator registry (`?question=`, `?version=`, `?status=` filter) with parameters and held-out evaluation |
 | `POST /v1/calibrators/{id}/activate` | Make a stored calibrator active (roll back); the current one is retired |
+| `POST /v1/thresholds/select` | The lowest automation threshold whose precision meets the target with confidence, the candidate curve and a held-out check. `404` unknown question, `422` invalid options or a calibrator that cannot score the data |
+| `POST /v1/conformal/fit` | A split-conformal predictor for a choice or predicate question, with held-out coverage and set sizes. `422` for score questions |
 
 ## Backends
 
@@ -457,7 +597,8 @@ CI runs the checks on Python 3.12 and 3.13 with a PostgreSQL 17 service containe
 `uv build`, a CLI smoke test, and an API smoke test that migrates the database, checks an
 idempotent replay, records an outcome over HTTP, replays it through `dgate outcomes ingest`
 and checks the stats count it once, then checks calibration metrics over HTTP and the CLI
-and runs the refit job (skipped on one label) against the calibrator registry. The Kafka
+and runs the refit job (skipped on one label) against the calibrator registry, threshold
+selection and a conformal fit over HTTP and the CLI, and `dgate fake-gate`. The Kafka
 source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License

@@ -240,3 +240,80 @@ endpoints and the CLI.
 rate using Wilson and Clopper-Pearson bounds, and split-conformal prediction sets for
 choice questions.
 
+
+
+## Day 6 (2026-11-03): threshold selection and conformal prediction sets
+
+CI on main was green (day 5's run passed), so the day went to the milestone.
+
+**Done**
+
+- `decision_gate.bounds`, stdlib only: the regularized incomplete beta function (continued
+  fraction, modified Lentz), beta quantiles by bisection, and one-sided and two-sided
+  Clopper-Pearson and Wilson bounds on a binomial proportion. Checked against scipy on
+  3,000 random cases during development (largest difference 5e-13); scipy is not a
+  dependency.
+- `decision_gate.thresholds`: candidate thresholds are the distinct scores accepting at
+  least `min_accepted` decisions (thinned to at most 100), tested as a fixed sequence from
+  the highest down. Each must have a lower confidence bound on precision at or above the
+  target; the search stops at the first failure. Because the order depends only on the
+  scores, the family-wise error stays at `1 - confidence` with no correction.
+- `decision_gate.conformal`: split-conformal predictors with the finite-sample
+  `ceil((n + 1)(1 - alpha))` quantile, LAC and non-randomised APS scores (APS always keeps
+  the top label, so its sets are never empty), set prediction, evaluation (coverage, mean
+  size, singleton rate and accuracy, empty rate, size counts) and JSON parameters.
+- `decision_gate.selection.GateAnalyzer`: runs both over stored decisions, scoring with
+  the active calibrator (temperature scaling also rescales the distributions conformal
+  sets use) and skipping the calibrator's own training decisions. The rest is split by
+  time into a selection part and a held-out check.
+- `POST /v1/thresholds/select` and `POST /v1/conformal/fit` (in a separate router module
+  to keep `app.py` from growing further), `dgate thresholds select`, `dgate conformal fit`,
+  and `dgate fake-gate` for a database-free run of the whole pipeline. CI smoke tests the
+  endpoints and commands against PostgreSQL.
+
+**Real run (in the README):** 3,000 labeled decisions per question from the fake with
+overconfidence 2, recorded through the API into PostgreSQL 16, then `refit --all`. For
+`refund.eligible` the calibrated threshold for 90% precision is 0.867 (24.4% automated,
+lower bound 0.908); on the 270 held-out decisions it automated 23.3% at precision 0.905.
+For `ticket.queue` no calibrated threshold qualified on the 630 eligible decisions, while
+raw scores with all 2,100 older decisions met the target at 19% automation.
+
+**Honest gaps:**
+
+- Skipping the calibrator's training decisions is the cautious rule for every calibrator,
+  but for a strictly increasing calibrator (Platt, and temperature scaling on two-label or
+  evenly spread distributions) the accepted sets are the same as on raw scores, so the
+  rule only costs statistical power, as `ticket.queue` shows. Day 7 will use all decisions
+  when the active calibrator is strictly increasing and keep the exclusion for isotonic
+  (whose pooled steps depend on the labels).
+- The `ticket.queue` LAC held-out coverage in the real run was 0.859 against a 0.9 target,
+  about two standard deviations low for 630 calibration and 270 held-out decisions. The
+  guarantee is an average over calibration sets; the tests check that average over 150
+  synthetic runs of a deliberately miscalibrated model, allowing 0.006 for noise.
+- APS is close to useless for two-label questions (it returned both labels for every
+  `refund.eligible` decision in `fake-gate`); LAC is the default.
+- The guarantee assumes the labeled decisions are representative of future traffic. Label
+  delay or selective labeling (only reviewed decisions get outcomes) would violate that;
+  drift monitoring (day 9) and sampling in the verify tier (day 7) are the mitigations.
+- Results are computed on request and not stored; the routing policy on day 7 will persist
+  the threshold and quantile it acts on.
+- `min_accepted` now defaults to 100. With 30, a single error in the first candidate
+  (29/30 has a 95% lower bound of 0.851) ended the search, and a simulation selected a
+  threshold in only 69 of 100 runs.
+
+**Tests:** 445 passing locally on Python 3.13 and 3.12 against SQLite and a local
+PostgreSQL 16 server, 100% line and branch coverage. Hand-worked fixtures: the binomial
+tail identity for the incomplete beta, Clopper-Pearson 5/10 (0.1871, 0.8129) and the
+closed forms for 0/n and n/n, Wilson 5/10 (0.2366, 0.7634), candidate thresholds with ties,
+a fixed sequence that stops on its first candidate even though a later one would pass, the
+conformal rank `ceil((n + 1)(1 - alpha))`, and LAC and APS sets on a five-decision example.
+Property checks: exact Clopper-Pearson coverage is never below 95% across 25 proportions,
+Wilson's dips below it somewhere, the selected threshold misses its target in at most 10%
+of 100 simulated runs (nominal 5%), and conformal coverage averages within bounds on a
+miscalibrated model. Integration tests cover the analyzer, both endpoints and the CLI on
+SQLite and PostgreSQL, including calibrator exclusion, unloadable calibrators and invalid
+data.
+
+**Next (day 7):** routing tiers: a YAML policy per question (error budget, confidence,
+minimum sample count, verify sampling rate), uncalibrated questions routed to a human, and
+`/v1/decide` responses that carry the calibrated probability, the tier and the reason.
