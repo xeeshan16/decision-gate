@@ -92,6 +92,10 @@ class BasisOut(BaseModel):
     excluded_training: int = Field(
         description="Skipped because the active calibrator was trained on them."
     )
+    reused_training: int = Field(
+        description="Calibrator training decisions kept because the calibrator preserves "
+        "their order, so reusing them cannot bias the result."
+    )
     selection_count: int
     holdout_count: int
     score_source: str
@@ -105,6 +109,7 @@ class BasisOut(BaseModel):
             question_version=basis.question_version,
             labeled=basis.labeled,
             excluded_training=basis.excluded_training,
+            reused_training=basis.reused_training,
             selection_count=basis.selection_count,
             holdout_count=basis.holdout_count,
             score_source=basis.score_source,

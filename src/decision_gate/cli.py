@@ -762,6 +762,8 @@ def _basis_line(basis: Any) -> str:
     )
     if basis.excluded_training:
         line += f", {basis.excluded_training} skipped (calibrator training data)"
+    if basis.reused_training:
+        line += f", {basis.reused_training} reused (the calibrator preserves their order)"
     return line
 
 

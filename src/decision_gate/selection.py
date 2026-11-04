@@ -1,10 +1,20 @@
 """Threshold selection and conformal calibration over the labeled decisions in the database.
 
-Both analyses use the *calibrated* view of each decision when a calibrator is active, and
-both must not reuse the calibrator's own training decisions: a score function fitted on a
-decision looks better on it than it will on new traffic, which would make the threshold
-or the conformal quantile optimistic. So when a calibrator is used, only decisions made
-after its training window (``trained_until``) are eligible.
+Both analyses use the *calibrated* view of each decision when a calibrator is active. A
+score function fitted on a decision can look better on it than it will on new traffic,
+which would make the threshold or the conformal quantile optimistic, so by default only
+decisions made after the calibrator's training window (``trained_until``) are eligible.
+
+The exception is a calibrator that cannot change *which* decisions an analysis groups
+together, only the numbers attached to them. Threshold selection accepts the decisions
+above a cut-off, so a strictly increasing calibrator (Platt scaling with a positive
+slope, temperature scaling on a two-label question) selects exactly the same accepted
+set as the raw scores would, and the fixed-sequence test is the same test. Conformal
+sets only read the distributions, which only temperature scaling changes, and on two
+labels it changes them monotonically. In those cases the training decisions are reused
+(``DataBasis.reused_training``) instead of thrown away. Isotonic regression pools
+neighbouring scores into steps chosen from the labels, and temperature scaling over
+three or more labels can reorder decisions, so both keep the exclusion.
 
 The eligible decisions, oldest first, are then split by time: the older part selects the
 threshold (or calibrates the conformal quantile) and the newer ``holdout`` part checks
@@ -18,6 +28,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 import numpy as np
 
@@ -26,6 +37,7 @@ from decision_gate.bounds import BoundMethod
 from decision_gate.calibrators import (
     AnyCalibrator,
     CalibrationError,
+    PlattCalibrator,
     TemperatureScaler,
     load_calibrator,
 )
@@ -76,6 +88,8 @@ class DataBasis:
     selection_count: int
     holdout_count: int
     calibrator: CalibratorRecord | None
+    reused_training: int = 0
+    """Calibrator training decisions kept because the calibrator preserves their order."""
 
     @property
     def question_key(self) -> str:
@@ -135,6 +149,25 @@ def calibrated_distributions(
     return result
 
 
+Purpose = Literal["thresholds", "conformal"]
+
+
+def reuses_training_data(
+    calibrator: AnyCalibrator, question: AnyQuestion, purpose: Purpose
+) -> bool:
+    """Whether an analysis can use the calibrator's own training decisions without bias."""
+    two_labels = isinstance(question, PredicateQuestion) or (
+        isinstance(question, ChoiceQuestion) and len(question.options) == 2
+    )
+    if isinstance(calibrator, TemperatureScaler):
+        return two_labels
+    if purpose == "conformal":
+        return True  # Platt and isotonic leave the distributions untouched.
+    if isinstance(calibrator, PlattCalibrator):
+        return calibrator.a > 0.0
+    return False
+
+
 class GateAnalyzer:
     def __init__(self, outcomes: OutcomeRepository, calibrators: CalibratorRepository) -> None:
         self._outcomes = outcomes
@@ -147,7 +180,9 @@ class GateAnalyzer:
         since: datetime | None,
         until: datetime | None,
         use_calibrator: bool,
-    ) -> tuple[list[LabeledRow], int, CalibratorRecord | None, AnyCalibrator | None]:
+        purpose: Purpose,
+    ) -> tuple[list[LabeledRow], int, int, CalibratorRecord | None, AnyCalibrator | None]:
+        """``(eligible rows, excluded, reused, calibrator record, calibrator)``."""
         rows = await self._outcomes.labeled_rows(
             question_id=question.id,
             question_version=question.version,
@@ -160,17 +195,18 @@ class GateAnalyzer:
             else None
         )
         if record is None:
-            return rows, 0, None, None
+            return rows, 0, 0, None, None
         try:
             calibrator = load_calibrator(record.method, record.params)
         except CalibrationError as exc:
             raise SelectionError(f"the active calibrator cannot be loaded: {exc}") from exc
-        if record.trained_until is not None:
-            cutoff = record.trained_until
-            eligible = [r for r in rows if r.created_at is None or r.created_at > cutoff]
-        else:  # pragma: no cover - the refit job always records the window
-            eligible = rows
-        return eligible, len(rows) - len(eligible), record, calibrator
+        if record.trained_until is None:  # pragma: no cover - the refit job records it
+            return rows, 0, 0, record, calibrator
+        cutoff = record.trained_until
+        after = [r for r in rows if r.created_at is None or r.created_at > cutoff]
+        if reuses_training_data(calibrator, question, purpose):
+            return rows, 0, len(rows) - len(after), record, calibrator
+        return after, len(rows) - len(after), 0, record, calibrator
 
     async def thresholds(
         self,
@@ -186,8 +222,12 @@ class GateAnalyzer:
         use_calibrator: bool = True,
     ) -> ThresholdReport:
         """Select the automation threshold for one question version."""
-        rows, excluded, record, calibrator = await self._rows(
-            question, since=since, until=until, use_calibrator=use_calibrator
+        rows, excluded, reused, record, calibrator = await self._rows(
+            question,
+            since=since,
+            until=until,
+            use_calibrator=use_calibrator,
+            purpose="thresholds",
         )
         n_select = split_point(len(rows), holdout)
         basis = DataBasis(
@@ -198,6 +238,7 @@ class GateAnalyzer:
             selection_count=n_select,
             holdout_count=len(rows) - n_select,
             calibrator=record,
+            reused_training=reused,
         )
         if n_select == 0:
             return ThresholdReport(basis=basis, selection=None, check=None)
@@ -248,8 +289,12 @@ class GateAnalyzer:
         labels: tuple[str, ...] = (
             question.options if isinstance(question, ChoiceQuestion) else ("false", "true")
         )
-        rows, excluded, record, calibrator = await self._rows(
-            question, since=since, until=until, use_calibrator=use_calibrator
+        rows, excluded, reused, record, calibrator = await self._rows(
+            question,
+            since=since,
+            until=until,
+            use_calibrator=use_calibrator,
+            purpose="conformal",
         )
         n_fit = split_point(len(rows), holdout)
         basis = DataBasis(
@@ -261,6 +306,7 @@ class GateAnalyzer:
             holdout_count=len(rows) - n_fit,
             # Only a temperature scaler changes the distributions conformal sets use.
             calibrator=record if isinstance(calibrator, TemperatureScaler) else None,
+            reused_training=reused if isinstance(calibrator, TemperatureScaler) else 0,
         )
         if n_fit == 0:
             return ConformalReport(
@@ -304,5 +350,6 @@ __all__ = [
     "SelectionError",
     "ThresholdReport",
     "calibrated_distributions",
+    "reuses_training_data",
     "split_point",
 ]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,17 +15,19 @@ from typer.testing import CliRunner
 
 from decision_gate.app import create_app
 from decision_gate.backends import FakeBackend
+from decision_gate.calibrators import IsotonicCalibrator, PlattCalibrator, TemperatureScaler
 from decision_gate.cli import app as cli
 from decision_gate.config import Settings
 from decision_gate.db import make_engine, make_sessionmaker
 from decision_gate.db.models import CalibratorRecord, DecisionRecord, OutcomeRecord
 from decision_gate.db.repository import CalibratorRepository, LabeledRow, OutcomeRepository
-from decision_gate.questions import QuestionCatalog
+from decision_gate.questions import ChoiceQuestion, PredicateQuestion, QuestionCatalog
 from decision_gate.refit import RefitJob
 from decision_gate.selection import (
     GateAnalyzer,
     SelectionError,
     calibrated_distributions,
+    reuses_training_data,
     split_point,
 )
 from decision_gate.thresholds import select_threshold
@@ -58,7 +60,14 @@ def refit(database_url: str, question: str) -> CalibratorRecord:
     return record
 
 
-def insert_calibrator(database_url: str, question: str, method: str, params: Any) -> None:
+def insert_calibrator(
+    database_url: str,
+    question: str,
+    method: str,
+    params: Any,
+    *,
+    trained_until: datetime | None = None,
+) -> None:
     record = CalibratorRecord(
         question_id=question,
         question_version=1,
@@ -70,7 +79,7 @@ def insert_calibrator(database_url: str, question: str, method: str, params: Any
         train_count=1,
         holdout_count=1,
         trained_from=BASE - timedelta(days=2),
-        trained_until=BASE - timedelta(days=1),
+        trained_until=trained_until or BASE - timedelta(days=1),
         evaluation={},
     )
     run(_insert(database_url, [record]))
@@ -121,6 +130,26 @@ def test_split_point() -> None:
     assert split_point(0, 0.3) == 0
     with pytest.raises(SelectionError, match="holdout"):
         split_point(10, 1.0)
+
+
+def test_which_calibrators_reuse_their_training_data(
+    predicate: PredicateQuestion, choice: ChoiceQuestion
+) -> None:
+    binary = ChoiceQuestion(id="two.labels", prompt="?", options=("x", "y"))
+    increasing, decreasing = PlattCalibrator(a=0.5, b=1.0), PlattCalibrator(a=-0.5)
+    isotonic = IsotonicCalibrator(x=(0.0, 1.0), y=(0.1, 0.9))
+    temperature = TemperatureScaler(temperature=2.0)
+    assert reuses_training_data(increasing, choice, "thresholds")
+    assert not reuses_training_data(decreasing, choice, "thresholds")
+    assert not reuses_training_data(isotonic, predicate, "thresholds")
+    assert reuses_training_data(temperature, predicate, "thresholds")
+    assert reuses_training_data(temperature, binary, "conformal")
+    # Over three or more labels temperature scaling can reorder decisions.
+    assert not reuses_training_data(temperature, choice, "thresholds")
+    assert not reuses_training_data(temperature, choice, "conformal")
+    # Platt and isotonic do not touch the distributions conformal sets are built from.
+    assert reuses_training_data(isotonic, choice, "conformal")
+    assert reuses_training_data(decreasing, choice, "conformal")
 
 
 def test_calibrated_distributions_need_a_distribution() -> None:
@@ -180,9 +209,11 @@ class TestThresholdsApi:
             json={"question": "refund.eligible", "max_error_rate": 0.1, "min_accepted": 50},
         ).json()
         basis = body["basis"]
-        # The refit trained on the oldest 70% (1050); only the 450 after it are eligible.
-        assert basis["excluded_training"] == 1050
-        assert (basis["selection_count"], basis["holdout_count"]) == (315, 135)
+        # The refit trained on the oldest 70% (1050). Temperature scaling on a two-label
+        # question is strictly increasing, so those decisions are reused, not skipped.
+        assert basis["excluded_training"] == 0
+        assert basis["reused_training"] == 1050
+        assert (basis["selection_count"], basis["holdout_count"]) == (1050, 450)
         assert basis["score_source"] == "calibrator v1 (temperature)"
         assert basis["calibrator_id"] == str(record.id)
         assert basis["calibrator_version"] == 1
@@ -268,8 +299,9 @@ class TestConformalApi:
         body = client.post("/v1/conformal/fit", json={"question": "refund.eligible"}).json()
         assert body["labels"] == ["false", "true"]
         assert body["basis"]["calibrator_id"] == str(record.id)
-        assert body["basis"]["excluded_training"] == 1050
-        assert body["calibration_count"] == 315
+        assert body["basis"]["excluded_training"] == 0
+        assert body["basis"]["reused_training"] == 1050
+        assert body["calibration_count"] == 1050
 
     def test_platt_calibrator_leaves_distributions_alone(
         self, client: TestClient, database_url: str, example_catalog: QuestionCatalog
@@ -366,7 +398,14 @@ class TestCli:
         self, database_url: str, example_catalog: QuestionCatalog
     ) -> None:
         seed_fake(database_url, example_catalog, "ticket.handling_minutes", 1500)
-        refit(database_url, "ticket.handling_minutes")
+        # Isotonic steps are chosen from the labels, so its training decisions are skipped.
+        insert_calibrator(
+            database_url,
+            "ticket.handling_minutes",
+            "isotonic",
+            {"x": [0.0, 1.0], "y": [0.0, 1.0]},
+            trained_until=BASE + timedelta(seconds=999),
+        )
         result = runner.invoke(
             cli,
             ["thresholds", "select", "ticket.handling_minutes", "--target-precision", "0.999",
