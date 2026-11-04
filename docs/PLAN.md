@@ -11,7 +11,7 @@ plan changes, this file is updated and the reason is logged in [PROGRESS.md](PRO
 | 4 | **Calibration metrics.** ECE, Brier score, log loss and reliability bins for each question, backend and version, tested against hand-computed fixtures. | done |
 | 5 | **Calibrators.** Platt scaling, isotonic regression (pool-adjacent-violators) and temperature scaling for multi-class questions. A versioned calibrator registry and a refit job. | done |
 | 6 | **Threshold selection.** Pick thresholds that meet a target precision or error rate using Wilson/Clopper-Pearson bounds. Split-conformal prediction sets for choice questions, so the answer set covers the true label at a guaranteed rate. | done |
-| 7 | **Routing tiers.** YAML policy for each question (error budget, minimum sample count). Questions that aren't calibrated yet go to a human. Each response includes the calibrated probability, the tier and the reason. | |
+| 7 | **Routing tiers.** YAML policy for each question (error budget, minimum sample count). Questions that aren't calibrated yet go to a human. Each response includes the calibrated probability, the tier and the reason. | done |
 | 8 | **Human review queue.** List, claim and resolve APIs with SLA timestamps. Resolutions feed back in as outcomes, which closes the loop. | |
 | 9 | **Drift monitoring.** Rolling-window ECE, population stability index (PSI) on the score distribution, and outcome-label rate. Thresholds tighten automatically and a webhook alert fires when drift is detected. | |
 | 10 | **Shadow mode.** Run a candidate backend or prompt version in shadow and compare calibrated performance before promoting it. | |

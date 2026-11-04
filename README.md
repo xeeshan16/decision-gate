@@ -45,7 +45,8 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Calibration metrics: ECE (with a bootstrap interval), MCE, Brier, log loss, multi-class scores and reliability bins, per question version, backend and model | ✅ day 4 |
 | Platt, isotonic and temperature calibrators, a versioned calibrator registry and a refit job that promotes a fit only if it wins on held-out decisions | ✅ day 5 |
 | Automation thresholds that meet a precision target with Clopper-Pearson or Wilson bounds (fixed-sequence testing), and split-conformal prediction sets (LAC, APS) for choice and predicate questions | ✅ day 6 |
-| Per-question routing policy and human review queue | planned (days 7-8) |
+| Routing tiers (auto, verify, human) from a per-question YAML policy: an error budget, minimum sample sizes, verify sampling and conformal answer sets; thresholds stored as audited rules that fail closed when the policy or calibrator changes | ✅ day 7 |
+| Human review queue that feeds resolutions back as outcomes | planned (day 8) |
 | Drift detection, shadow mode, simulator, observability | planned (days 9-12) |
 
 ## Architecture
@@ -125,6 +126,7 @@ Run the API. It needs PostgreSQL (any recent version; CI uses 17):
 ```bash
 export DGATE_DATABASE_URL=postgresql+asyncpg://dgate:dgate@localhost:5432/dgate
 export DGATE_QUESTIONS_FILE=examples/questions.yaml
+export DGATE_ROUTING_FILE=examples/routing.yaml
 uv run dgate db upgrade          # apply Alembic migrations
 uv run dgate serve --port 8080
 ```
@@ -144,7 +146,8 @@ $ curl -s -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
  "idempotency_key":"order-1042","created_at":"2026-10-30T09:58:06.815632Z"}
 ```
 
-(Output wrapped for readability.) `GET /v1/decisions/{id}` returns a stored decision,
+(Output wrapped for readability; the routing fields are left out here and described under
+[Routing tiers](#routing-tiers).) `GET /v1/decisions/{id}` returns a stored decision,
 including its outcome once one is recorded.
 
 ### Outcomes
@@ -468,8 +471,9 @@ What this shows, warts included:
   cautious choice for any calibrator, but for a strictly increasing one (Platt, or
   temperature scaling on the fake's distributions, where the other options share the
   remaining probability equally) the accepted sets are exactly those of the raw scores, so
-  the exclusion costs power without buying validity. Using all decisions when
-  the calibrator is strictly increasing is on the list for day 7.
+  the exclusion costs power without buying validity. Since day 7, decisions are reused
+  when the calibrator cannot reorder them (see [Routing tiers](#routing-tiers)); this run
+  is kept as it was recorded on day 6.
 - The `ticket.queue` held-out coverage of 0.859 is below the 0.9 target. The guarantee is
   on average over calibration sets; with 630 calibration and 270 held-out decisions the
   standard deviation of this number is about 0.02, so this run is roughly two standard
@@ -505,8 +509,120 @@ Threshold options: `question`, `version`, `target_precision` (default 0.95) or
 `min_accepted` (100), `holdout` (0.3), `since`/`until`, `use_calibrator` (true) and
 `curve_points` (10). Conformal options: `question`, `version`, `alpha` (0.1), `method`
 (`lac`, `aps`), `holdout`, `since`/`until` and `use_calibrator`; the response includes the
-`params` needed to rebuild the predictor. Neither result is stored yet: the routing policy
-(day 7) will persist the threshold and quantile it acts on.
+`params` needed to rebuild the predictor. These endpoints only analyse; routing rules
+(below) store the thresholds and quantile that decisions are actually routed with.
+
+### Routing tiers
+
+Every decision gets a tier, decided before it is stored and returned with it:
+
+| Tier | Meaning | When |
+| --- | --- | --- |
+| `auto` | Use the answer as is | The calibrated probability is at or above the rule's auto threshold, and the decision was not sampled |
+| `verify` | A person confirms the proposed answer | At or above the verify threshold but below auto, or sampled from the automatable decisions (`verify_sample_rate`) |
+| `human` | A person decides from scratch | Everything the gate cannot vouch for: no policy, not calibrated, too few labels, a stale rule, or a score below every threshold |
+
+The policy is configuration ([examples/routing.yaml](examples/routing.yaml)); the
+thresholds are data. `POST /v1/routing/refresh` (or `dgate routing refresh`) selects them
+from labeled decisions with the fixed-sequence test above and stores them as the active
+**routing rule** for each question version, keeping the old ones for audit:
+
+```yaml
+defaults:
+  confidence: 0.95          # confidence that the auto tier meets its error budget
+  min_labeled: 200          # nothing is automated on fewer eligible labeled decisions
+  min_accepted: 100         # a threshold must accept at least this many of them
+  verify_sample_rate: 0.05  # 5% of automatable decisions go to verify anyway, for labels
+  require_calibrator: true  # route to a human until a calibrator is active
+questions:
+  refund.eligible:
+    max_error_rate: 0.10        # auto tier: at most 10% wrong
+    verify_max_error_rate: 0.25 # looser budget for the verify threshold
+    conformal_alpha: 0.10       # answer sets for the people handling the rest
+```
+
+Design choices worth calling out:
+
+- **Fail closed, and say why.** A routing problem never fails the request: the decision
+  goes to `human` with a `reason` (`refund.eligible@v1 is not calibrated yet`, `the active
+  calibrator changed since the thresholds were selected`, ...).
+- **A threshold is only valid on the scores it was selected on.** Each rule records the
+  policy fingerprint and the calibrator it was selected under. A refit that activates a
+  new calibrator, a rollback, or an edited policy makes the rule stale, and every decision
+  goes to a human until the rule is refreshed. `GET /v1/routing/status` shows which
+  questions are `current` and which are not.
+- **Verify sampling keeps the labels honest.** If only decisions people looked at got
+  labels, calibration would only ever see the hard cases. A fixed fraction of automatable
+  decisions is sent to `verify`; the draw is a hash of the decision id, so it is
+  reproducible and auditable.
+- **Replays are stable.** The tier is stored with the decision, so an idempotent retry
+  returns the original tier even if the rule changed in between.
+- **Training decisions are reused when that is safe.** A strictly increasing calibrator
+  (Platt with a positive slope, temperature scaling on two labels) cannot change which
+  decisions a threshold accepts, so threshold selection uses its training decisions too.
+  Isotonic regression, and temperature scaling over three or more labels, keep the
+  exclusion. The analysis responses report both counts (`excluded_training`,
+  `reused_training`).
+
+A real run against PostgreSQL 16: 3,000 decisions per question recorded through the API
+with their fake ground truth, `dgate calibrators refit --all`, then a refresh with the
+example policies:
+
+```console
+$ uv run dgate routing refresh
+refund.eligible@v1: auto 0.8688, verify 0.5379, answer sets yes (3000 of 3000 labeled decisions used)
+  scores from calibrator v1 (temperature); auto: accept score >= 0.8688: 24.8% of decisions, precision 0.9207 (685/744), 95% lower bound 0.9025 >= target 0.9000; the next candidate 0.8645 failed; verify: accept score >= 0.5379: 93.2% of decisions, precision 0.7639 (2135/2795), 95% lower bound 0.7503 >= target 0.7500; the next candidate 0.5340 failed; answer sets: lac sets with quantile 0.6902 cover the true label with probability >= 90%
+ticket.queue@v1: auto none, verify 0.6554, answer sets yes (900 of 3000 labeled decisions used)
+  scores from calibrator v1 (temperature); auto: none (even the highest threshold 0.8991 has a 95% lower bound of 0.9108 on precision (96/100), below the target 0.9500); verify: accept score >= 0.6554: 39.9% of decisions, precision 0.8384 (301/359), 95% lower bound 0.8030 >= target 0.8000; the next candidate 0.6488 failed; answer sets: lac sets with quantile 0.8980 cover the true label with probability >= 90%
+ticket.handling_minutes@v1: auto 0.6109, verify none, answer sets no (3000 of 3000 labeled decisions used)
+  scores from calibrator v1 (platt); auto: accept score >= 0.6109: 78.5% of decisions, precision 0.8162 (1923/2356), 95% lower bound 0.8026 >= target 0.8000; the next candidate 0.6046 failed
+```
+
+A decision now carries its routing:
+
+```console
+$ curl -s -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
+    -d '{"question": "refund.eligible", "input": {"order_age_days": 12, "item": "headphones"}}'
+{"id":"2e1fd38f-97b2-431d-bd3a-402cccb672db","question":"refund.eligible","question_version":1,
+ "answer":true,"confidence":0.7618304815842805,"calibrated_confidence":0.6344386674137995,
+ "tier":"verify","reason":"calibrated probability 0.6344 >= verify threshold 0.5379",
+ "answer_set":[true,false],"routing_rule_id":"a3455b09-3cf0-40b4-9982-ea0458ef5bb4", ...}
+```
+
+Then 2,000 fresh decisions per question, scored against the fake's ground truth (which the
+gate never saw for these):
+
+| Question | auto | verify | human | Answer sets |
+| --- | --- | --- | --- | --- |
+| `refund.eligible` (budget 10%) | 21.4%, accuracy 0.953 | 70.9%, accuracy 0.712 | 7.8%, accuracy 0.542 | mean size 1.53, contain the truth 90.5% |
+| `ticket.queue` (budget 5%) | none | 41.9%, accuracy 0.840 | 58.1%, accuracy 0.448 | mean size 3.01, contain the truth 91.0% |
+| `ticket.handling_minutes` (budget 20%) | 73.4%, accuracy 0.793 | 3.5%, accuracy 0.843 | 23.2%, accuracy 0.603 | n/a (score question) |
+
+Reading it honestly:
+
+- `refund.eligible` automates a fifth of the traffic at 95% accuracy against a 90% target.
+- `ticket.handling_minutes` automated at 0.793 against a 0.80 target. The guarantee is
+  that, with 95% confidence, the *long-run* precision above the threshold is at least
+  0.80; one sample of 1,467 decisions has a standard error of about 0.011, so this is
+  0.7 standard errors low, which is unremarkable. The selection itself was tight (lower
+  bound 0.8026 against 0.80).
+- `ticket.queue` automates nothing: 900 eligible decisions cannot prove a 5% error rate,
+  and temperature scaling over five labels may reorder decisions, so its 2,100 training
+  decisions stay excluded. More labels, or a looser budget, would change that.
+- The verify threshold bounds the precision of *everything at or above it*, not of the
+  verify band alone: for `refund.eligible` the band itself ran at 0.712, while auto and
+  verify together ran at 0.768, above the 0.75 target. A verify threshold says "worth a
+  quick check", not "almost right".
+
+Policy fields (all optional): `max_error_rate` (0.05), `confidence` (0.95), `bound`
+(`clopper-pearson`), `min_labeled` (200), `min_accepted` (100), `require_calibrator`
+(true), `verify_max_error_rate` (unset: no verify threshold), `verify_sample_rate` (0.05),
+`conformal_alpha` (unset: no answer sets) and `conformal_method` (`lac`). `defaults` is
+merged into every question's policy; a `default` policy covers questions that are not
+listed (without one they always go to a human). `dgate routing check` validates a file
+against the catalog and flags policies for unknown questions. A running server caches each
+question's rule and calibrator for `DGATE_ROUTING_CACHE_TTL_S` seconds; a refresh, refit or
+activation through the API clears the cache at once.
 
 ### Endpoints
 
@@ -526,6 +642,9 @@ Threshold options: `question`, `version`, `target_precision` (default 0.95) or
 | `POST /v1/calibrators/{id}/activate` | Make a stored calibrator active (roll back); the current one is retired |
 | `POST /v1/thresholds/select` | The lowest automation threshold whose precision meets the target with confidence, the candidate curve and a held-out check. `404` unknown question, `422` invalid options or a calibrator that cannot score the data |
 | `POST /v1/conformal/fit` | A split-conformal predictor for a choice or predicate question, with held-out coverage and set sizes. `422` for score questions |
+| `POST /v1/routing/refresh` | Select and store routing rules for one question (`{"question": ...}`) or every routed one (`{}`). `404` unknown or unrouted question, `422` data that cannot be analysed |
+| `GET /v1/routing/status` | Per question version: its policy, its active rule and whether the rule is `current`, or why decisions are going to a human (`no_policy`, `no_rule`, `policy_changed`, `calibrator_changed`) |
+| `GET /v1/routing/rules`, `GET /v1/routing/rules/{id}` | Rule history, newest first (`?question=`, `?version=`, `?status=` filter) |
 
 ## Backends
 
@@ -545,6 +664,8 @@ never a silently stored decision.
 | --- | --- | --- |
 | `DGATE_QUESTIONS_FILE` | unset | YAML or JSON question catalog |
 | `DGATE_DATABASE_URL` | `postgresql+asyncpg://dgate:dgate@localhost:5432/dgate` | SQLAlchemy async database URL |
+| `DGATE_ROUTING_FILE` | unset | YAML or JSON routing policies; without one every decision goes to a human |
+| `DGATE_ROUTING_CACHE_TTL_S` | `5` | How long the router caches a question's rule and calibrator (`0` disables the cache) |
 | `DGATE_STORE_INPUTS` | `true` | Store decision inputs; when `false` only a SHA-256 of the input is kept |
 | `DGATE_BACKEND` | `fake` | `fake`, `http` or `llm_json` |
 | `DGATE_BACKEND_TIMEOUT_S` | `10` | Time limit for one backend call |
@@ -598,7 +719,9 @@ CI runs the checks on Python 3.12 and 3.13 with a PostgreSQL 17 service containe
 idempotent replay, records an outcome over HTTP, replays it through `dgate outcomes ingest`
 and checks the stats count it once, then checks calibration metrics over HTTP and the CLI
 and runs the refit job (skipped on one label) against the calibrator registry, threshold
-selection and a conformal fit over HTTP and the CLI, and `dgate fake-gate`. The Kafka
+selection and a conformal fit over HTTP and the CLI, `dgate fake-gate`, `dgate routing
+check`, and routing: the first decision goes to a human because nothing is calibrated, and
+a refresh over HTTP stores a current rule for every question. The Kafka
 source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License

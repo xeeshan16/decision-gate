@@ -317,3 +317,70 @@ data.
 **Next (day 7):** routing tiers: a YAML policy per question (error budget, confidence,
 minimum sample count, verify sampling rate), uncalibrated questions routed to a human, and
 `/v1/decide` responses that carry the calibrated probability, the tier and the reason.
+
+## Day 7 (2026-11-04): routing tiers
+
+**Done:**
+
+- `decision_gate.routing`: a YAML routing policy per question (`max_error_rate`,
+  `confidence`, `bound`, `min_labeled`, `min_accepted`, `require_calibrator`,
+  `verify_max_error_rate`, `verify_sample_rate`, `conformal_alpha`, `conformal_method`),
+  with shared `defaults`, an optional `default` policy for unlisted questions, and a stable
+  fingerprint. `examples/routing.yaml` covers the three example questions.
+- `RoutingRefresher` selects the auto threshold (and optionally a verify threshold under
+  a looser budget, and conformal answer-set parameters) from labeled decisions and stores
+  them in a new `routing_rules` table (migration 0004), one active rule per question
+  version and the rest retired for audit. Each rule records the policy fingerprint and the
+  calibrator it was selected under.
+- `Router` assigns `auto`, `verify` or `human` to every new decision before it is stored:
+  calibrated probability against the thresholds, a reproducible verify sample (a hash of
+  the decision id) from the automatable decisions, and `human` with a reason whenever
+  there is no policy, no calibrator, too few labels, a stale rule (policy or calibrator
+  changed), or a calibrator that cannot be loaded or cannot score the decision. Rules and
+  calibrators are cached per question for `DGATE_ROUTING_CACHE_TTL_S`; refreshes, refits
+  and activations through the API clear the cache.
+- `/v1/decide` responses (and stored decisions) now carry `calibrated_confidence`, `tier`,
+  `reason`, `answer_set` and `routing_rule_id`. Replays return the stored tier.
+- `POST /v1/routing/refresh`, `GET /v1/routing/status`, `GET /v1/routing/rules[/{id}]`,
+  `dgate routing check` and `dgate routing refresh`. CI smoke tests the routing flow
+  against PostgreSQL.
+- Day 6 follow-up: threshold selection and conformal fits now reuse the calibrator's
+  training decisions when the calibrator cannot reorder them (Platt with a positive slope,
+  temperature scaling on two labels; conformal sets also with Platt and isotonic, which do
+  not touch the distributions). Isotonic, and temperature over three or more labels, keep
+  the exclusion. Responses report `reused_training` next to `excluded_training`.
+
+**Real run (in the README):** 3,000 labeled decisions per question through the API into
+PostgreSQL 16, `refit --all`, `dgate routing refresh`, then 2,000 fresh decisions per
+question scored against the fake's ground truth. `refund.eligible` (10% budget): 21.4%
+automated at accuracy 0.953. `ticket.handling_minutes` (20% budget): 73.4% automated at
+0.793, 0.7 standard errors below the 0.80 target on this sample (the guarantee is on the
+long-run rate, and the selection's lower bound was 0.8026). `ticket.queue` (5% budget):
+nothing automated, because 900 eligible decisions cannot prove a 5% error rate.
+
+**Honest gaps:**
+
+- The verify threshold bounds the precision of everything at or above it, not of the
+  verify band on its own: for `refund.eligible` the band ran at 0.712 while auto plus
+  verify ran at 0.768 against a 0.75 target. The README says so; a band-specific bound
+  would need a different test.
+- Rules are refreshed on request (HTTP or CLI), not on a schedule. Drift monitoring (day
+  9) is where automatic tightening belongs; until then an operator or a cron job calls
+  the refresh endpoint.
+- A CLI refresh against a running server takes effect after the cache TTL (5 s by
+  default); the HTTP refresh applies at once.
+- Sampled decisions go to `verify`, but nothing yet turns verify or human tiers into work
+  items. That is the review queue (day 8), whose resolutions will flow back as outcomes.
+
+**Tests:** 492 passing locally on Python 3.13 against SQLite and a local PostgreSQL 16
+server, 100% line and branch coverage. New: policy parsing, merging, validation and
+fingerprints; sampling is deterministic and uniform; end-to-end routing on the fake with
+a refit calibrator (every decision's tier is checked against the stored thresholds and the
+recomputed sample, and auto accuracy on fresh decisions); stale rules after a new
+calibrator or a policy change; replays keep their tier; too few labels; raw-confidence
+routing; calibrators that cannot load or score; trivial, failed and mismatched answer
+sets; the router cache and its invalidation; the HTTP and CLI error paths; and which
+calibrators may reuse their training decisions.
+
+**Next (day 8):** the human review queue: list, claim and resolve verify and human
+decisions with SLA timestamps, and feed resolutions back as outcomes.
