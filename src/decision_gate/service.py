@@ -2,8 +2,9 @@
 
 ``DecisionService`` asks the backend, validates, persists and answers. ``OutcomeService``
 records the ground truth that arrives later and scores it against the stored decision.
-Calibration and routing slot in here in later milestones; for now every decision is
-recorded with the backend's raw confidence so that outcomes can be joined to it.
+Each decision is routed (auto, verify or human) before it is stored, and the tier is
+stored with it, so an idempotent replay returns the same tier even if the thresholds
+have changed since.
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ from decision_gate.backends.base import AnyQuestion, BackendError, DecisionBacke
 from decision_gate.db.models import DecisionRecord, OutcomeRecord
 from decision_gate.db.repository import DecisionRepository, OutcomeRepository
 from decision_gate.questions import Answer, QuestionCatalog
+from decision_gate.routing import Router
+
+MAX_REASON_LENGTH = 500
 
 
 class BackendTimeoutError(BackendError):
@@ -44,11 +48,13 @@ class DecisionService:
         *,
         timeout_s: float,
         store_inputs: bool = True,
+        router: Router | None = None,
     ) -> None:
         self._backend = backend
         self._repository = repository
         self._timeout_s = timeout_s
         self._store_inputs = store_inputs
+        self._router = router
 
     async def decide(
         self,
@@ -75,8 +81,9 @@ class DecisionService:
             ) from exc
         latency_ms = (time.perf_counter() - started) * 1000.0
 
+        decision_id = uuid.uuid4()
         record = DecisionRecord(
-            id=uuid.uuid4(),
+            id=decision_id,
             idempotency_key=idempotency_key,
             question_id=question.id,
             question_version=question.version,
@@ -89,6 +96,16 @@ class DecisionService:
             model_version=raw.model_version,
             latency_ms=latency_ms,
         )
+        if self._router is not None:
+            route = await self._router.route(
+                question, decision_id, raw.answer, raw.confidence, raw.probabilities
+            )
+            record.tier = route.tier
+            record.routing_reason = _clip(route.reason, MAX_REASON_LENGTH)
+            record.calibrated_confidence = route.calibrated_confidence
+            record.calibrator_id = route.calibrator_id
+            record.routing_rule_id = route.rule_id
+            record.answer_set = route.answer_set
         stored, created = await self._repository.add(record)
         if not created:
             self._check_replay(stored, question, digest)
@@ -106,6 +123,10 @@ class DecisionService:
                 "idempotency key was already used for a different question or input"
             )
         return record
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 class UnknownDecisionError(LookupError):

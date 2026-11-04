@@ -30,6 +30,7 @@ from decision_gate.db.repository import (
     DecisionRepository,
     LabelStats,
     OutcomeRepository,
+    RoutingRuleRepository,
 )
 from decision_gate.gating_api import gating_router
 from decision_gate.metrics import BinStrategy, ReliabilityBin
@@ -42,6 +43,8 @@ from decision_gate.refit import (
     RefitOutcome,
     RefitResult,
 )
+from decision_gate.routing import Router, RoutingConfig, RoutingRefresher, Tier, load_routing
+from decision_gate.routing_api import routing_router
 from decision_gate.selection import GateAnalyzer
 from decision_gate.service import (
     BackendTimeoutError,
@@ -323,6 +326,19 @@ class DecisionOut(BaseModel):
     question_version: int
     answer: Answer
     confidence: float = Field(description="Raw, uncalibrated confidence from the backend.")
+    calibrated_confidence: float | None = Field(
+        description="Probability that the answer is correct, from the active calibrator."
+    )
+    tier: Tier | None = Field(
+        description="auto: use the answer; verify: a person confirms it; human: a person "
+        "decides. Null for decisions recorded before routing existed."
+    )
+    reason: str | None = Field(description="Why the decision got its tier.")
+    answer_set: list[Answer] | None = Field(
+        description="Conformal answer set for decisions a person handles, when configured: "
+        "contains the true answer with the policy's coverage rate."
+    )
+    routing_rule_id: uuid.UUID | None
     probabilities: dict[str, float] | None
     backend: str
     model_version: str
@@ -343,6 +359,11 @@ class DecisionOut(BaseModel):
             question_version=record.question_version,
             answer=record.answer,
             confidence=record.confidence,
+            calibrated_confidence=record.calibrated_confidence,
+            tier=record.tier,
+            reason=record.routing_reason,
+            answer_set=record.answer_set,
+            routing_rule_id=record.routing_rule_id,
             probabilities=record.probabilities,
             backend=record.backend,
             model_version=record.model_version,
@@ -359,12 +380,15 @@ def create_app(
     catalog: QuestionCatalog | None = None,
     backend: DecisionBackend | None = None,
     engine: AsyncEngine | None = None,
+    routing: RoutingConfig | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     if catalog is None:
         catalog = (
             load_catalog(settings.questions_file) if settings.questions_file else QuestionCatalog()
         )
+    if routing is None:
+        routing = load_routing(settings.routing_file) if settings.routing_file else RoutingConfig()
     backend = backend or build_backend(settings)
     engine = engine or make_engine(settings.database_url)
     sessions = make_sessionmaker(engine)
@@ -373,11 +397,20 @@ def create_app(
     outcome_service = OutcomeService(catalog, repository, outcome_repository)
     calibrator_repository = CalibratorRepository(sessions)
     refit_job = RefitJob(outcome_repository, calibrator_repository)
+    rule_repository = RoutingRuleRepository(sessions)
+    analyzer = GateAnalyzer(outcome_repository, calibrator_repository)
+    router = Router(
+        routing,
+        rule_repository,
+        calibrator_repository,
+        cache_ttl_s=settings.routing_cache_ttl_s,
+    )
     service = DecisionService(
         backend,
         repository,
         timeout_s=settings.backend_timeout_s,
         store_inputs=settings.store_inputs,
+        router=router,
     )
 
     @asynccontextmanager
@@ -399,6 +432,7 @@ def create_app(
     app.state.backend = backend
     app.state.engine = engine
     app.state.outcome_service = outcome_service
+    app.state.router = router
 
     @app.get("/healthz", tags=["ops"])
     async def healthz() -> dict[str, str]:
@@ -616,6 +650,7 @@ def create_app(
             )
         except CalibrationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        router.invalidate()
         return RefitOut.from_result(result)
 
     @app.get("/v1/calibrators", tags=["calibrators"])
@@ -654,9 +689,16 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if record is None:
             raise HTTPException(status_code=404, detail="unknown calibrator")
+        router.invalidate()
         return CalibratorOut.from_record(record)
 
+    app.include_router(gating_router(catalog, analyzer))
     app.include_router(
-        gating_router(catalog, GateAnalyzer(outcome_repository, calibrator_repository))
+        routing_router(
+            catalog,
+            router,
+            RoutingRefresher(routing, analyzer, calibrator_repository, rule_repository),
+            rule_repository,
+        )
     )
     return app

@@ -21,6 +21,15 @@ class Settings(BaseSettings):
         default=DEFAULT_DATABASE_URL,
         description="SQLAlchemy async URL. PostgreSQL (asyncpg) in production.",
     )
+    routing_file: Path | None = Field(
+        default=None,
+        description="YAML or JSON routing policies. Without one every decision goes to a human.",
+    )
+    routing_cache_ttl_s: float = Field(
+        default=5.0,
+        ge=0,
+        description="How long the router caches a question's rule and calibrator (0 = never).",
+    )
     store_inputs: bool = Field(
         default=True,
         description="Keep each decision's input. When false only its SHA-256 hash is stored.",

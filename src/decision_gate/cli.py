@@ -50,6 +50,10 @@ conformal_app = typer.Typer(
     help="Calibrate conformal prediction sets for choice questions.", no_args_is_help=True
 )
 app.add_typer(conformal_app, name="conformal")
+routing_app = typer.Typer(
+    help="Routing tiers: check policies, refresh rules, show status.", no_args_is_help=True
+)
+app.add_typer(routing_app, name="routing")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -1027,3 +1031,129 @@ def fake_gate(
                 f"quantile {predictor.quantile:.4f}  check: coverage {result.coverage:.3f}, "
                 f"mean size {result.mean_size:.2f}, singletons {result.singleton_rate:.1%}"
             )
+
+
+RoutingPath = Annotated[
+    Path | None,
+    typer.Option("--routing", "-r", help="Routing policies. Defaults to DGATE_ROUTING_FILE."),
+]
+
+
+def _routing_config(path: Path | None) -> Any:
+    from decision_gate.config import Settings
+    from decision_gate.routing import RoutingConfigError, load_routing
+
+    path = path or Settings().routing_file
+    if path is None:
+        typer.echo("error: pass --routing or set DGATE_ROUTING_FILE", err=True)
+        raise typer.Exit(code=2)
+    try:
+        return load_routing(path)
+    except RoutingConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _policy_line(policy: Any) -> str:
+    line = (
+        f"auto error <= {policy.max_error_rate:.1%} at {policy.confidence:.0%} confidence, "
+        f"min {policy.min_labeled} labeled"
+    )
+    if policy.verify_max_error_rate is not None:
+        line += f", verify error <= {policy.verify_max_error_rate:.1%}"
+    line += f", {policy.verify_sample_rate:.0%} of auto sampled to verify"
+    if policy.conformal_alpha is not None:
+        line += f", answer sets at {1 - policy.conformal_alpha:.0%} coverage"
+    if not policy.require_calibrator:
+        line += ", raw confidence allowed"
+    return line
+
+
+@routing_app.command("check")
+def routing_check(
+    path: Annotated[Path, typer.Argument(help="Routing policy file (YAML or JSON).")],
+    questions: OptionalCatalogPath = None,
+) -> None:
+    """Validate a routing file and show the policy each catalog question gets."""
+    config = _routing_config(path)
+    catalog = _catalog_for_ingest(questions)
+    for question in catalog.questions:
+        policy = config.policy_for(question.id)
+        if policy is None:
+            typer.echo(f"{question.key}: no policy (every decision goes to a human)")
+        else:
+            typer.echo(f"{question.key}: [{policy.fingerprint()}] {_policy_line(policy)}")
+    unknown = config.unknown_questions(catalog)
+    if unknown:
+        typer.echo(f"error: policies for questions not in the catalog: {unknown}", err=True)
+        raise typer.Exit(code=1)
+
+
+async def _refresh(database_url: str, config: Any, targets: list[Any]) -> list[Any]:
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import (
+        CalibratorRepository,
+        OutcomeRepository,
+        RoutingRuleRepository,
+    )
+    from decision_gate.routing import RoutingRefresher
+    from decision_gate.selection import GateAnalyzer
+
+    engine = make_engine(database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        calibrators = CalibratorRepository(sessions)
+        refresher = RoutingRefresher(
+            config,
+            GateAnalyzer(OutcomeRepository(sessions), calibrators),
+            calibrators,
+            RoutingRuleRepository(sessions),
+        )
+        return [(await refresher.refresh(q)).rule for q in targets]
+    finally:
+        await engine.dispose()
+
+
+def _fmt_threshold(value: float | None) -> str:
+    return "none" if value is None else f"{value:.4f}"
+
+
+@routing_app.command("refresh")
+def routing_refresh(
+    question: Annotated[
+        str | None, typer.Argument(help="Question id. Omit to refresh every routed question.")
+    ] = None,
+    version: Annotated[int | None, typer.Option(min=1, help="Question version.")] = None,
+    routing: RoutingPath = None,
+    questions: OptionalCatalogPath = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Select thresholds from labeled decisions and store them as the active rules.
+
+    A running server caches rules for DGATE_ROUTING_CACHE_TTL_S seconds; the HTTP refresh
+    endpoint applies them at once.
+    """
+    from decision_gate.selection import SelectionError
+
+    config = _routing_config(routing)
+    catalog = _catalog_for_ingest(questions)
+    if question is not None:
+        targets = [_question(question, version, questions)]
+        if config.policy_for(question) is None:
+            typer.echo(f"error: no routing policy covers {question}", err=True)
+            raise typer.Exit(code=1)
+    else:
+        targets = [q for q in catalog.questions if config.policy_for(q.id) is not None]
+    try:
+        rules = asyncio.run(_refresh(_database_url(url), config, targets))
+    except SelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    for rule in rules:
+        typer.echo(
+            f"{rule.question_key}: auto {_fmt_threshold(rule.auto_threshold)}, verify "
+            f"{_fmt_threshold(rule.verify_threshold)}, "
+            f"answer sets {'yes' if rule.conformal else 'no'} "
+            f"({rule.eligible} of {rule.labeled} labeled decisions used)"
+        )
+        typer.echo(f"  {rule.reason}")

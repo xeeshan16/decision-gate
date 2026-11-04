@@ -11,7 +11,12 @@ from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from decision_gate.db.models import CalibratorRecord, DecisionRecord, OutcomeRecord
+from decision_gate.db.models import (
+    CalibratorRecord,
+    DecisionRecord,
+    OutcomeRecord,
+    RoutingRuleRecord,
+)
 
 
 class DecisionRepository:
@@ -376,3 +381,85 @@ class CalibratorRepository:
             .values(status="retired")
         )
         await session.flush()
+
+
+class RoutingRuleRepository:
+    """Routing rules: the thresholds each question version is routed with, kept for audit."""
+
+    MAX_ATTEMPTS = 5
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def get(self, rule_id: uuid.UUID) -> RoutingRuleRecord | None:
+        async with self._sessions() as session:
+            return await session.get(RoutingRuleRecord, rule_id)
+
+    async def active(self, question_id: str, question_version: int) -> RoutingRuleRecord | None:
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(RoutingRuleRecord).where(
+                    RoutingRuleRecord.question_id == question_id,
+                    RoutingRuleRecord.question_version == question_version,
+                    RoutingRuleRecord.status == "active",
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def find(
+        self,
+        *,
+        question_id: str | None = None,
+        question_version: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[RoutingRuleRecord]:
+        """Newest rule first within each question version."""
+        query = (
+            select(RoutingRuleRecord)
+            .order_by(
+                RoutingRuleRecord.question_id,
+                RoutingRuleRecord.question_version,
+                RoutingRuleRecord.created_at.desc(),
+            )
+            .limit(limit)
+        )
+        if question_id is not None:
+            query = query.where(RoutingRuleRecord.question_id == question_id)
+        if question_version is not None:
+            query = query.where(RoutingRuleRecord.question_version == question_version)
+        if status is not None:
+            query = query.where(RoutingRuleRecord.status == status)
+        async with self._sessions() as session:
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def add_active(self, record: RoutingRuleRecord) -> RoutingRuleRecord:
+        """Store a rule as the active one, retiring the current one in the same transaction.
+
+        Two concurrent refreshes can both retire the old rule and insert; the partial unique
+        index rejects the second insert, which then retries and retires the first.
+        """
+        record.status = "active"
+        for _attempt in range(self.MAX_ATTEMPTS):
+            async with self._sessions() as session:
+                await session.execute(
+                    update(RoutingRuleRecord)
+                    .where(
+                        RoutingRuleRecord.question_id == record.question_id,
+                        RoutingRuleRecord.question_version == record.question_version,
+                        RoutingRuleRecord.status == "active",
+                    )
+                    .values(status="retired")
+                )
+                session.add(record)
+                try:
+                    await session.commit()
+                except IntegrityError:  # pragma: no cover - needs an exact race
+                    await session.rollback()
+                    continue
+                return record
+        raise ActivationConflictError(  # pragma: no cover - needs repeated lost races
+            f"could not store a routing rule for {record.question_key} after "
+            f"{self.MAX_ATTEMPTS} attempts (concurrent refreshes)"
+        )

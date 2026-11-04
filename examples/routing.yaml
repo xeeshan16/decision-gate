@@ -1,0 +1,31 @@
+# Routing policies for the example questions (see docs: "Routing tiers").
+#
+# Every decision lands in a tier: auto (use the answer), verify (a person confirms it) or
+# human (a person decides). Thresholds are not set here: `dgate routing refresh` selects
+# them from labeled decisions so that the auto tier's error rate stays within
+# max_error_rate with the given confidence, and stores them as routing rules.
+
+# Shared by every policy below; each question can override any field.
+defaults:
+  confidence: 0.95          # confidence that the auto tier meets its error budget
+  min_labeled: 200          # nothing is automated on fewer eligible labeled decisions
+  min_accepted: 100         # a threshold must accept at least this many of them
+  verify_sample_rate: 0.05  # 5% of automatable decisions go to verify anyway, for labels
+  require_calibrator: true  # route to a human until a calibrator is active
+
+# No `default:` policy, so questions not listed below always go to a human.
+
+questions:
+  refund.eligible:
+    max_error_rate: 0.10        # auto tier: at most 10% wrong
+    verify_max_error_rate: 0.25 # verify tier: a reviewer confirms answers that are
+                                # right at least 75% of the time
+    conformal_alpha: 0.10       # attach answer sets for the people handling the rest
+
+  ticket.queue:
+    max_error_rate: 0.05
+    verify_max_error_rate: 0.20
+    conformal_alpha: 0.10       # the set of queues a ticket probably belongs to
+
+  ticket.handling_minutes:
+    max_error_rate: 0.20        # an estimate within 15 minutes, 80% of the time

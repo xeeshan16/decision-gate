@@ -70,11 +70,13 @@ jobs:
           uv run dgate questions check examples/questions.yaml
           uv run dgate ask refund.eligible -q examples/questions.yaml -i '{"order_age_days": 12}'
           uv run dgate fake-gate -q examples/questions.yaml -n 2000 --target-precision 0.9
+          uv run dgate routing check examples/routing.yaml -q examples/questions.yaml
 
       - name: Smoke test the API against PostgreSQL
         env:
           DGATE_DATABASE_URL: ${{ env.DGATE_TEST_DATABASE_URL }}
           DGATE_QUESTIONS_FILE: examples/questions.yaml
+          DGATE_ROUTING_FILE: examples/routing.yaml
         run: |
           uv run dgate db downgrade base
           uv run dgate db upgrade
@@ -85,9 +87,12 @@ jobs:
           server=$!
           trap 'kill "$server"' EXIT
           for _ in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
-          id=$(curl -sf -X POST localhost:8080/v1/decide \
+          first=$(curl -sf -X POST localhost:8080/v1/decide \
             -H 'content-type: application/json' -H 'Idempotency-Key: smoke-1' \
-            -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}' | jq -r .id)
+            -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}')
+          # Nothing is calibrated yet, so the decision goes to a human.
+          echo "$first" | jq -e '.tier == "human" and (.reason | endswith("not calibrated yet"))'
+          id=$(echo "$first" | jq -r .id)
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/decide \
             -H 'content-type: application/json' -H 'Idempotency-Key: smoke-1' \
             -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}')
@@ -121,3 +126,11 @@ jobs:
             | jq -e '.trivial == true and .calibration_count == 1'
           .venv/bin/dgate thresholds select ticket.queue --min-accepted 1 --holdout 0
           .venv/bin/dgate conformal fit ticket.queue --holdout 0 | grep -q "every label"
+          # Routing rules: with no calibrator and one label, nothing can be automated, and
+          # every question's rule is current until a policy or calibrator changes.
+          curl -sf -X POST localhost:8080/v1/routing/refresh \
+            -H 'content-type: application/json' -d '{}' \
+            | jq -e '(.rules | length) == 3 and all(.rules[]; .auto_threshold == null)'
+          curl -sf localhost:8080/v1/routing/status \
+            | jq -e 'all(.questions[]; .state == "current")'
+          .venv/bin/dgate routing refresh ticket.queue | grep -q "auto none"
