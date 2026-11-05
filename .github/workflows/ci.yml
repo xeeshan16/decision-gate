@@ -134,3 +134,22 @@ jobs:
           curl -sf localhost:8080/v1/routing/status \
             | jq -e 'all(.questions[]; .state == "current")'
           .venv/bin/dgate routing refresh ticket.queue | grep -q "auto none"
+          # Review queue: every decision so far went to a human. The first one's outcome
+          # arrived over HTTP, so its review item was superseded. A new decision waits in
+          # the queue; claiming and resolving it records the answer as its outcome.
+          curl -sf 'localhost:8080/v1/reviews?state=superseded' | jq -e '(.items | length) == 1'
+          second=$(curl -sf -X POST localhost:8080/v1/decide \
+            -H 'content-type: application/json' \
+            -d '{"question": "ticket.queue", "input": {"subject": "where is my parcel"}}' \
+            | jq -r .id)
+          item=$(curl -sf -X POST localhost:8080/v1/reviews/claim \
+            -H 'content-type: application/json' -d '{"reviewer": "ci"}')
+          echo "$item" | jq -e --arg d "$second" '.decision_id == $d and .state == "claimed"'
+          curl -sf -X POST "localhost:8080/v1/reviews/$(echo "$item" | jq -r .id)/resolve" \
+            -H 'content-type: application/json' -d '{"reviewer": "ci", "outcome": "shipping"}' \
+            | jq -e '.item.verdict == "decided" and .item.state == "resolved"'
+          curl -sf "localhost:8080/v1/decisions/$second" | jq -e '.outcome.source == "review"'
+          curl -sf localhost:8080/v1/reviews/stats \
+            | jq -e '.queues[0].resolved == 1 and .queues[0].superseded == 1'
+          .venv/bin/dgate reviews backfill | grep -q "enqueued 0"
+          .venv/bin/dgate reviews stats
