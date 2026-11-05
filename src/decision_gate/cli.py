@@ -54,6 +54,10 @@ routing_app = typer.Typer(
     help="Routing tiers: check policies, refresh rules, show status.", no_args_is_help=True
 )
 app.add_typer(routing_app, name="routing")
+reviews_app = typer.Typer(
+    help="The human review queue: list, claim, resolve and measure.", no_args_is_help=True
+)
+app.add_typer(reviews_app, name="reviews")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -1157,3 +1161,262 @@ def routing_refresh(
             f"({rule.eligible} of {rule.labeled} labeled decisions used)"
         )
         typer.echo(f"  {rule.reason}")
+
+
+# --- Review queue ------------------------------------------------------------------------
+
+
+async def _with_reviews(database_url: str, catalog: Any, work: Any) -> Any:
+    from decision_gate.config import Settings
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import ReviewRepository
+    from decision_gate.questions import QuestionCatalog
+    from decision_gate.reviews import ReviewService
+
+    engine = make_engine(database_url)
+    try:
+        service = ReviewService(
+            catalog or QuestionCatalog(),
+            ReviewRepository(make_sessionmaker(engine)),
+            Settings().review_sla,
+        )
+        return await work(service)
+    finally:
+        await engine.dispose()
+
+
+def _run_review(url: str | None, work: Any, catalog: Any = None) -> Any:
+    """Run one queue action; not-found and conflicts exit with status 1."""
+    from decision_gate.db.repository import ReviewConflictError, ReviewNotFoundError
+    from decision_gate.reviews import InvalidResolutionError
+
+    try:
+        return asyncio.run(_with_reviews(_database_url(url), catalog, work))
+    except (ReviewNotFoundError, ReviewConflictError, InvalidResolutionError) as exc:
+        typer.echo(f"error: {exc.args[0] if exc.args else exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _minutes(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value < 120:
+        return f"{value:.0f}m"
+    return f"{value / 60:.1f}h"
+
+
+def _item_line(item: Any, decision: Any, now: datetime) -> str:
+    from decision_gate.reviews import as_utc, is_overdue, item_state
+
+    state = item_state(item, now)
+    due = as_utc(item.due_at)
+    late = " OVERDUE" if is_overdue(item, now) else ""
+    who = f" by {item.resolved_by or item.claimed_by}" if state in ("claimed", "resolved") else ""
+    calibrated = (
+        "-" if decision.calibrated_confidence is None else f"{decision.calibrated_confidence:.3f}"
+    )
+    line = (
+        f"{item.id}  {item.question_key:<28} {item.tier:<6} {state}{who}{late}  "
+        f"due {due:%Y-%m-%d %H:%M}Z  answer {json.dumps(decision.answer)} "
+        f"(calibrated {calibrated})"
+    )
+    if item.resolution is not None:
+        line += f" -> {json.dumps(item.resolution)} [{item.verdict}]"
+    return line
+
+
+ReviewerOption = Annotated[str, typer.Option("--reviewer", help="Who is acting.")]
+ReviewIdArgument = Annotated[str, typer.Argument(help="Review item id.")]
+
+
+def _item_id(raw: str) -> Any:
+    import uuid
+
+    try:
+        return uuid.UUID(raw)
+    except ValueError as exc:
+        typer.echo(f"error: not a review item id: {raw}", err=True)
+        raise typer.Exit(code=2) from exc
+
+
+def _check_choice(value: str | None, allowed: tuple[str, ...], option: str) -> None:
+    if value is not None and value not in allowed:
+        typer.echo(f"error: {option} must be one of {list(allowed)}", err=True)
+        raise typer.Exit(code=2)
+
+
+@reviews_app.command("list")
+def reviews_list(
+    state: Annotated[
+        str | None,
+        typer.Option(help="available, claimed, resolved or superseded."),
+    ] = None,
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    tier: Annotated[str | None, typer.Option(help="verify or human.")] = None,
+    overdue: Annotated[
+        bool | None, typer.Option("--overdue/--on-time", help="Only late (or on-time) items.")
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, max=10_000)] = 50,
+    url: DatabaseURL = None,
+) -> None:
+    """Review items, earliest deadline first."""
+    from decision_gate.reviews import REVIEW_STATES, REVIEW_TIERS
+
+    _check_choice(state, REVIEW_STATES, "--state")
+    _check_choice(tier, REVIEW_TIERS, "--tier")
+
+    async def work(service: Any) -> tuple[list[Any], datetime]:
+        found = await service.find(
+            state=state, question_id=question, tier=tier, overdue=overdue, limit=limit
+        )
+        return found, service.now()
+
+    found, now = _run_review(url, work)
+    if not found:
+        typer.echo("no review items match")
+        return
+    for item, decision in found:
+        typer.echo(_item_line(item, decision, now))
+
+
+@reviews_app.command("claim")
+def reviews_claim(
+    reviewer: ReviewerOption,
+    item: Annotated[
+        str | None, typer.Argument(help="Item id. Omit to claim the most urgent one.")
+    ] = None,
+    question: Annotated[str | None, typer.Option(help="Only items for this question.")] = None,
+    tier: Annotated[str | None, typer.Option(help="verify or human.")] = None,
+    lease: Annotated[
+        float | None, typer.Option(min=0.1, max=480, help="Claim length in minutes.")
+    ] = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Claim an item under a lease (the most urgent one unless an id is given)."""
+    from decision_gate.reviews import REVIEW_TIERS
+
+    _check_choice(tier, REVIEW_TIERS, "--tier")
+    item_id = _item_id(item) if item is not None else None
+
+    async def work(service: Any) -> tuple[Any, datetime]:
+        if item_id is not None:
+            found = await service.claim(item_id, reviewer, lease_minutes=lease)
+        else:
+            found = await service.claim_next(
+                reviewer, question_id=question, tier=tier, lease_minutes=lease
+            )
+        return found, service.now()
+
+    found, now = _run_review(url, work)
+    if found is None:
+        typer.echo("nothing is waiting")
+        return
+    claimed, decision = found
+    typer.echo(_item_line(claimed, decision, now))
+    if decision.answer_set is not None:
+        typer.echo(f"  answer set: {json.dumps(decision.answer_set)}")
+    if decision.input is not None:
+        typer.echo(f"  input: {json.dumps(decision.input, sort_keys=True)}")
+
+
+@reviews_app.command("release")
+def reviews_release(
+    item: ReviewIdArgument, reviewer: ReviewerOption, url: DatabaseURL = None
+) -> None:
+    """Give a claimed item back to the queue."""
+    item_id = _item_id(item)
+
+    async def work(service: Any) -> Any:
+        return await service.release(item_id, reviewer)
+
+    released, _decision = _run_review(url, work)
+    typer.echo(f"released {released.id}")
+
+
+@reviews_app.command("resolve")
+def reviews_resolve(
+    item: ReviewIdArgument,
+    reviewer: ReviewerOption,
+    outcome: Annotated[
+        str | None, typer.Option(help='The correct answer as JSON, e.g. true, "billing", 25.')
+    ] = None,
+    confirm: Annotated[
+        bool, typer.Option("--confirm", help="The backend's answer is right.")
+    ] = False,
+    note: Annotated[str | None, typer.Option(help="Optional note for the audit trail.")] = None,
+    questions: OptionalCatalogPath = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Resolve an item; the answer is recorded as the decision's outcome."""
+    item_id = _item_id(item)
+    if confirm == (outcome is not None):
+        typer.echo("error: pass exactly one of --outcome or --confirm", err=True)
+        raise typer.Exit(code=2)
+    value: Any = None
+    if outcome is not None:
+        try:
+            value = json.loads(outcome)
+        except json.JSONDecodeError:
+            value = outcome  # a bare word such as billing is a string answer
+    catalog = _catalog_for_ingest(questions)
+
+    async def work(service: Any) -> Any:
+        return await service.resolve(item_id, reviewer, outcome=value, confirm=confirm, note=note)
+
+    resolved, _decision, recorded, created = _run_review(url, work, catalog)
+    typer.echo(
+        f"{'resolved' if created else 'already resolved'} {resolved.id}: "
+        f"{json.dumps(recorded.outcome)} [{resolved.verdict}], backend "
+        f"{'right' if recorded.correct else 'wrong'}"
+    )
+
+
+@reviews_app.command("stats")
+def reviews_stats(
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    since: Annotated[
+        datetime | None, typer.Option(help="Only items created at or after this time (UTC).")
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead.")] = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Backlog, SLA performance and backend agreement per question version and tier."""
+    from decision_gate.reviews_api import QueueStatsOut
+
+    async def work(service: Any) -> tuple[list[Any], Any]:
+        return await service.stats(question_id=question, since=_as_utc(since)), service.sla
+
+    stats, sla = _run_review(url, work)
+    if as_json:
+        payload = [QueueStatsOut.from_stats(s).model_dump(mode="json") for s in stats]
+        typer.echo(json.dumps({"queues": payload}, indent=2))
+        return
+    if not stats:
+        typer.echo("no review items")
+        return
+    typer.echo(
+        f"SLA: verify {_minutes(sla.verify_minutes)}, human {_minutes(sla.human_minutes)}, "
+        f"claims last {_minutes(sla.claim_minutes)}"
+    )
+    typer.echo(
+        f"{'queue':<36} {'avail':>6} {'claim':>6} {'late':>5} {'oldest':>7} {'done':>6} "
+        f"{'on-time':>8} {'median':>7} {'p90':>6} {'agree':>6}"
+    )
+    for s in stats:
+        label = f"{s.question_id}@v{s.question_version} {s.tier}"
+        typer.echo(
+            f"{label:<36} {s.available:>6} {s.claimed:>6} {s.overdue:>5} "
+            f"{_minutes(s.oldest_waiting_minutes):>7} {s.resolved:>6} "
+            f"{_fmt(s.sla_hit_rate, '.1%'):>8} {_minutes(s.median_minutes):>7} "
+            f"{_minutes(s.p90_minutes):>6} {_fmt(s.agreement_rate, '.1%'):>6}"
+        )
+
+
+@reviews_app.command("backfill")
+def reviews_backfill(url: DatabaseURL = None) -> None:
+    """Enqueue verify and human decisions recorded before the review queue existed."""
+
+    async def work(service: Any) -> int:
+        return int(await service.backfill())
+
+    typer.echo(f"enqueued {_run_review(url, work)} decision(s)")

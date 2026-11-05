@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from decision_gate.reviews import ReviewSla
+
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://dgate:dgate@localhost:5432/dgate"
 
 
@@ -29,6 +31,17 @@ class Settings(BaseSettings):
         default=5.0,
         ge=0,
         description="How long the router caches a question's rule and calibrator (0 = never).",
+    )
+    review_verify_sla_minutes: float = Field(
+        default=60.0, gt=0, description="Deadline for resolving a verify item."
+    )
+    review_human_sla_minutes: float = Field(
+        default=240.0, gt=0, description="Deadline for resolving a human item."
+    )
+    review_claim_minutes: float = Field(
+        default=15.0,
+        gt=0,
+        description="How long a claim lasts before the item returns to the queue.",
     )
     store_inputs: bool = Field(
         default=True,
@@ -83,3 +96,11 @@ class Settings(BaseSettings):
                 "DGATE_LLM_BASE_URL and DGATE_LLM_MODEL are required when DGATE_BACKEND=llm_json"
             )
         return self
+
+    @property
+    def review_sla(self) -> ReviewSla:
+        return ReviewSla(
+            verify_minutes=self.review_verify_sla_minutes,
+            human_minutes=self.review_human_sla_minutes,
+            claim_minutes=self.review_claim_minutes,
+        )

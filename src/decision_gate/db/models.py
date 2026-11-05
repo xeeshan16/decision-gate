@@ -199,3 +199,55 @@ class RoutingRuleRecord(Base):
     @property
     def question_key(self) -> str:
         return f"{self.question_id}@v{self.question_version}"
+
+
+class ReviewItemRecord(Base):
+    """One decision waiting for, held by, or handled by a person.
+
+    Every ``verify`` and ``human`` decision gets exactly one review item, created in the
+    same transaction as the decision (the decision id is unique here). ``status`` moves
+    ``open`` -> ``claimed`` -> ``resolved``; a claim is a lease that expires, after which
+    the item can be claimed again. If the decision's ground truth arrives some other way
+    first (a later business event, a Kafka label), the item becomes ``superseded`` and
+    leaves the queue. Resolving an item records its outcome in the same transaction, which
+    is how reviews flow back into calibration.
+    """
+
+    __tablename__ = "review_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    decision_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("decisions.id", ondelete="CASCADE"), unique=True
+    )
+    question_id: Mapped[str] = mapped_column(String(64))
+    question_version: Mapped[int] = mapped_column(Integer)
+    tier: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    """The SLA deadline: resolve by then."""
+    claims: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    """How many times the item was claimed; more than one means a lease ran out or was
+    released."""
+    claimed_by: Mapped[str | None] = mapped_column(String(200))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[str | None] = mapped_column(String(200))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution: Mapped[Any] = mapped_column(JSONType, nullable=True)
+    """The answer the reviewer gave, which is also stored as the decision's outcome."""
+    verdict: Mapped[str | None] = mapped_column(String(16))
+    """``confirmed`` or ``corrected`` for verify items, ``decided`` for human items."""
+    agreed: Mapped[bool | None] = mapped_column(Boolean)
+    """Whether the backend's answer was correct by the reviewer's outcome."""
+    note: Mapped[str | None] = mapped_column(String(1000))
+
+    __table_args__ = (
+        # Claiming the next item scans unresolved items by deadline.
+        Index(None, "status", "due_at"),
+        Index(None, "question_id", "question_version", "status"),
+    )
+
+    @property
+    def question_key(self) -> str:
+        return f"{self.question_id}@v{self.question_version}"

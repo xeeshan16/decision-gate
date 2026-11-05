@@ -30,6 +30,7 @@ from decision_gate.db.repository import (
     DecisionRepository,
     LabelStats,
     OutcomeRepository,
+    ReviewRepository,
     RoutingRuleRepository,
 )
 from decision_gate.gating_api import gating_router
@@ -43,6 +44,8 @@ from decision_gate.refit import (
     RefitOutcome,
     RefitResult,
 )
+from decision_gate.reviews import Clock, ReviewService, utc_now
+from decision_gate.reviews_api import reviews_router
 from decision_gate.routing import Router, RoutingConfig, RoutingRefresher, Tier, load_routing
 from decision_gate.routing_api import routing_router
 from decision_gate.selection import GateAnalyzer
@@ -381,6 +384,7 @@ def create_app(
     backend: DecisionBackend | None = None,
     engine: AsyncEngine | None = None,
     routing: RoutingConfig | None = None,
+    clock: Clock = utc_now,
 ) -> FastAPI:
     settings = settings or Settings()
     if catalog is None:
@@ -411,6 +415,10 @@ def create_app(
         timeout_s=settings.backend_timeout_s,
         store_inputs=settings.store_inputs,
         router=router,
+        review_sla=settings.review_sla,
+    )
+    review_service = ReviewService(
+        catalog, ReviewRepository(sessions), settings.review_sla, clock=clock
     )
 
     @asynccontextmanager
@@ -692,6 +700,7 @@ def create_app(
         router.invalidate()
         return CalibratorOut.from_record(record)
 
+    app.include_router(reviews_router(review_service))
     app.include_router(gating_router(catalog, analyzer))
     app.include_router(
         routing_router(

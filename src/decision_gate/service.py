@@ -4,7 +4,8 @@
 records the ground truth that arrives later and scores it against the stored decision.
 Each decision is routed (auto, verify or human) before it is stored, and the tier is
 stored with it, so an idempotent replay returns the same tier even if the thresholds
-have changed since.
+have changed since. Verify and human decisions are enqueued for review in the same
+transaction.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from decision_gate.backends.base import AnyQuestion, BackendError, DecisionBacke
 from decision_gate.db.models import DecisionRecord, OutcomeRecord
 from decision_gate.db.repository import DecisionRepository, OutcomeRepository
 from decision_gate.questions import Answer, QuestionCatalog
+from decision_gate.reviews import ReviewSla
 from decision_gate.routing import Router
 
 MAX_REASON_LENGTH = 500
@@ -49,12 +51,14 @@ class DecisionService:
         timeout_s: float,
         store_inputs: bool = True,
         router: Router | None = None,
+        review_sla: ReviewSla | None = None,
     ) -> None:
         self._backend = backend
         self._repository = repository
         self._timeout_s = timeout_s
         self._store_inputs = store_inputs
         self._router = router
+        self._review_sla = review_sla
 
     async def decide(
         self,
@@ -95,6 +99,7 @@ class DecisionService:
             backend=raw.backend,
             model_version=raw.model_version,
             latency_ms=latency_ms,
+            created_at=datetime.now(UTC),
         )
         if self._router is not None:
             route = await self._router.route(
@@ -106,7 +111,8 @@ class DecisionService:
             record.calibrator_id = route.calibrator_id
             record.routing_rule_id = route.rule_id
             record.answer_set = route.answer_set
-        stored, created = await self._repository.add(record)
+        review = self._review_sla.new_item(record) if self._review_sla else None
+        stored, created = await self._repository.add(record, review)
         if not created:
             self._check_replay(stored, question, digest)
         return stored, created
