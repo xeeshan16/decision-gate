@@ -46,7 +46,7 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Platt, isotonic and temperature calibrators, a versioned calibrator registry and a refit job that promotes a fit only if it wins on held-out decisions | ✅ day 5 |
 | Automation thresholds that meet a precision target with Clopper-Pearson or Wilson bounds (fixed-sequence testing), and split-conformal prediction sets (LAC, APS) for choice and predicate questions | ✅ day 6 |
 | Routing tiers (auto, verify, human) from a per-question YAML policy: an error budget, minimum sample sizes, verify sampling and conformal answer sets; thresholds stored as audited rules that fail closed when the policy or calibrator changes | ✅ day 7 |
-| Human review queue that feeds resolutions back as outcomes | planned (day 8) |
+| Human review queue: every verify and human decision is enqueued with an SLA deadline; reviewers claim (leased, `SKIP LOCKED`), release and resolve; a resolution is recorded as the decision's outcome in the same transaction; backlog, SLA and agreement stats | ✅ day 8 |
 | Drift detection, shadow mode, simulator, observability | planned (days 9-12) |
 
 ## Architecture
@@ -624,6 +624,95 @@ against the catalog and flags policies for unknown questions. A running server c
 question's rule and calibrator for `DGATE_ROUTING_CACHE_TTL_S` seconds; a refresh, refit or
 activation through the API clears the cache at once.
 
+### Review queue
+
+Routing decides who handles a decision; the review queue is where people handle it. Every
+`verify` and `human` decision gets a review item **in the same transaction as the
+decision**, so nothing a person must see can be stored without its place in the queue.
+
+```text
+ decide ──► verify / human ──► review item (open, due in 60m / 4h)
+                                   │ claim (lease, 15m)        ▲ lease lapses or release
+                                   ▼                           │
+                                claimed ───────────────────────┘
+                                   │ resolve {outcome | confirm}
+                                   ▼
+                    resolved ──► outcome (source "review") ──► refit, refresh
+ an outcome from anywhere else ──► superseded (leaves the queue)
+```
+
+- **Earliest deadline first.** `POST /v1/reviews/claim` hands out the available item with
+  the earliest SLA deadline, so overdue items come first and a 60-minute verify item is
+  served before a 4-hour human item that arrived at the same time. Filter by `question`
+  or `tier` to build per-team queues.
+- **Claims are leases.** A claim lasts `DGATE_REVIEW_CLAIM_MINUTES` (or `lease_minutes`
+  per request); an item abandoned mid-review returns to the queue on its own, and the
+  holder can renew by claiming again. `claims` counts how often an item changed hands.
+- **No double work.** On PostgreSQL the next item is picked with `FOR UPDATE SKIP LOCKED`,
+  so concurrent reviewers get different items instead of queueing on one row; every state
+  change is a conditional `UPDATE`, so a lost race is a `409`, never a silent overwrite.
+- **Resolving records the truth.** `POST /v1/reviews/{id}/resolve` takes the correct
+  answer (`outcome`) or `confirm: true` for the backend's answer, validates it against the
+  question, and writes the outcome (`source: "review"`) and the resolution in one
+  transaction. Verify items are `confirmed` or `corrected`, human items `decided`; every
+  item records whether the backend was right (`agreed`). Retrying the same resolution is a
+  `200`; a different answer for a resolved item is a `409`, because rewriting a label would
+  rewrite what calibration was fitted on.
+- **Labels from elsewhere win the race.** If an outcome arrives over HTTP or Kafka first
+  (a chargeback, a ticket that was actually moved), the item is `superseded` in the same
+  transaction and leaves the queue.
+- **The verify sample closes the loop without bias.** Review labels come mostly from the
+  hard cases. The `verify_sample_rate` slice of automatable decisions is what keeps
+  labels flowing for the auto band, which is why the router samples it.
+
+`GET /v1/reviews/stats` (and `dgate reviews stats`) reports, per question version and tier:
+the backlog (available, claimed, overdue, oldest waiting), SLA performance (share resolved
+on time, median and p90 minutes from decision to resolution) and how often reviewers agreed
+with the backend, with a 95% Wilson interval. Agreement on the verify tier is a direct,
+continuously measured check of the band's real accuracy.
+
+A real run against PostgreSQL 16, starting from an empty database: 3,000 decisions per
+question through the API (all `human`, nothing is calibrated), worked off by four
+concurrent scripted reviewers that answer with the fake's ground truth, then
+`refit` and `routing refresh` on **labels that all came from the review queue**, then
+2,000 more decisions per question and the same reviewers again:
+
+```console
+$ uv run dgate reviews stats --since 2026-11-05T10:08:30
+SLA: verify 60m, human 4.0h, claims last 15m
+queue                                 avail  claim  late  oldest   done  on-time  median    p90  agree
+refund.eligible@v1 human                  2      0     0      0m    170   100.0%      1m     1m  59.4%
+refund.eligible@v1 verify                15      0     0      0m   1358   100.0%      0m     0m  70.8%
+ticket.handling_minutes@v1 human          3      0     0      0m    417   100.0%      1m     1m  53.2%
+ticket.handling_minutes@v1 verify         1      0     0      0m     79   100.0%      0m     0m  87.3%
+ticket.queue@v1 human                    14      0     0      0m   1179   100.0%      1m     1m  43.0%
+ticket.queue@v1 verify                    6      0     0      0m    821   100.0%      0m     0m  85.1%
+
+$ uv run dgate reviews claim --reviewer ann --question ticket.queue
+b926aba6-b8a4-4939-bba7-609810548c2f  ticket.queue@v1              verify claimed by ann  due 2026-11-05 11:09Z  answer "other" (calibrated 0.776)
+  answer set: ["other"]
+  input: {"item": 200004}
+```
+
+What it shows, and what it does not:
+
+- The loop closes: the 13,024 outcomes in that database all have `source: "review"`, and
+  the calibrators and routing rules fitted on them are the same ones the day 7 run fitted
+  on labels posted directly (same thresholds: 0.8688 auto and 0.5379 verify for
+  `refund.eligible`).
+- Four reviewers claimed concurrently and resolved 13,024 items with no `409`, and no
+  item was claimed more than once.
+- Reviewer agreement separates the tiers as the thresholds intend: on `refund.eligible`
+  the verify band ran at 70.8% (95% interval 68.3% to 73.1%; the day 7 run measured the
+  same band at 71.2%), the human band at 59.4%.
+- The SLA columns are trivially perfect here because the reviewers are a script: the
+  median human item waited about a minute, behind the verify items whose deadlines were
+  earlier. The 20 decisions left at the end are the backlog.
+
+`POST /v1/reviews/backfill` (or `dgate reviews backfill`) enqueues verify and human
+decisions recorded before the queue existed; their deadlines count from the decision time,
+so they arrive overdue, which is the truth about how long they waited.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -645,6 +734,12 @@ activation through the API clears the cache at once.
 | `POST /v1/routing/refresh` | Select and store routing rules for one question (`{"question": ...}`) or every routed one (`{}`). `404` unknown or unrouted question, `422` data that cannot be analysed |
 | `GET /v1/routing/status` | Per question version: its policy, its active rule and whether the rule is `current`, or why decisions are going to a human (`no_policy`, `no_rule`, `policy_changed`, `calibrator_changed`) |
 | `GET /v1/routing/rules`, `GET /v1/routing/rules/{id}` | Rule history, newest first (`?question=`, `?version=`, `?status=` filter) |
+| `GET /v1/reviews`, `GET /v1/reviews/{id}` | Review items with the decision a reviewer needs (answer, calibrated probability, answer set, input), earliest deadline first (`?state=available\|claimed\|resolved\|superseded`, `?question=`, `?tier=`, `?claimed_by=`, `?overdue=`) |
+| `POST /v1/reviews/claim` | Claim the most urgent available item (`{"reviewer", "question"?, "tier"?, "lease_minutes"?}`); `204` when nothing is waiting |
+| `POST /v1/reviews/{id}/claim`, `POST /v1/reviews/{id}/release` | Claim (or renew) one item; give it back. `404` unknown, `409` held by someone else, resolved or superseded |
+| `POST /v1/reviews/{id}/resolve` | Resolve with `{"reviewer", "outcome"}` or `{"reviewer", "confirm": true}`; the answer becomes the decision's outcome. `201` resolved, `200` same resolution replayed, `409` conflict, `422` invalid answer |
+| `GET /v1/reviews/stats` | Backlog, overdue count, SLA hit rate, median and p90 resolution time, and backend agreement with a Wilson interval, per question version and tier (`?question=`, `?since=`) |
+| `POST /v1/reviews/backfill` | Enqueue verify and human decisions recorded before the queue existed |
 
 ## Backends
 
@@ -666,6 +761,9 @@ never a silently stored decision.
 | `DGATE_DATABASE_URL` | `postgresql+asyncpg://dgate:dgate@localhost:5432/dgate` | SQLAlchemy async database URL |
 | `DGATE_ROUTING_FILE` | unset | YAML or JSON routing policies; without one every decision goes to a human |
 | `DGATE_ROUTING_CACHE_TTL_S` | `5` | How long the router caches a question's rule and calibrator (`0` disables the cache) |
+| `DGATE_REVIEW_VERIFY_SLA_MINUTES` | `60` | Deadline for resolving a verify item |
+| `DGATE_REVIEW_HUMAN_SLA_MINUTES` | `240` | Deadline for resolving a human item |
+| `DGATE_REVIEW_CLAIM_MINUTES` | `15` | How long a claim lasts before the item returns to the queue |
 | `DGATE_STORE_INPUTS` | `true` | Store decision inputs; when `false` only a SHA-256 of the input is kept |
 | `DGATE_BACKEND` | `fake` | `fake`, `http` or `llm_json` |
 | `DGATE_BACKEND_TIMEOUT_S` | `10` | Time limit for one backend call |

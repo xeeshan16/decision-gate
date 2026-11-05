@@ -384,3 +384,71 @@ calibrators may reuse their training decisions.
 
 **Next (day 8):** the human review queue: list, claim and resolve verify and human
 decisions with SLA timestamps, and feed resolutions back as outcomes.
+
+## Day 8 (2026-11-05): human review queue
+
+**Shipped:**
+
+- `review_items` table (migration 0005): one item per `verify` or `human` decision, with
+  `created_at`, an SLA `due_at`, claim fields (`claimed_by`, `claimed_at`,
+  `claim_expires_at`, `claims`) and resolution fields (`resolved_by`, `resolved_at`,
+  `resolution`, `verdict`, `agreed`, `note`). The item is inserted in the same transaction
+  as its decision; an idempotent replay never enqueues twice.
+- SLAs per tier (`DGATE_REVIEW_VERIFY_SLA_MINUTES` 60, `DGATE_REVIEW_HUMAN_SLA_MINUTES`
+  240) and claim leases (`DGATE_REVIEW_CLAIM_MINUTES` 15, or `lease_minutes` per claim).
+  An expired lease puts the item back in the queue without any background job: "available"
+  is computed from the lease time.
+- `POST /v1/reviews/claim` gives out the earliest-deadline available item, using
+  `FOR UPDATE SKIP LOCKED` on PostgreSQL plus a conditional `UPDATE` as the real guard (the
+  only one on SQLite). Claim one item, renew your own claim, release it; a lost race is a
+  `409`.
+- `POST /v1/reviews/{id}/resolve` with an `outcome` or `confirm: true` validates the answer,
+  then stores the resolution and the outcome (`source: "review"`) in one transaction under
+  a row lock. Verdicts: `confirmed` / `corrected` (verify), `decided` (human). Same
+  resolution again is a `200`; a different one is a `409`.
+- Outcomes recorded any other way (HTTP, batch, JSON Lines, Kafka) supersede the waiting
+  item in the same transaction as the outcome insert.
+- `GET /v1/reviews` (filters: state, question, tier, claimed_by, overdue) shows each item
+  with what a reviewer needs (answer, raw and calibrated confidence, answer set, routing
+  reason, input). `GET /v1/reviews/stats` gives backlog, overdue, oldest waiting, SLA hit
+  rate, median and p90 resolution minutes, and agreement with a 95% Wilson interval, per
+  question version and tier.
+- `POST /v1/reviews/backfill` for verify and human decisions stored on day 7, before the
+  queue existed.
+- CLI: `dgate reviews list | claim | release | resolve | stats | backfill`. CI smoke tests
+  the queue against PostgreSQL: a superseded item, then claim, resolve and the resulting
+  outcome.
+
+**Real run (in the README):** empty PostgreSQL 16 database; 3,000 decisions per question
+through the API (all human); four concurrent scripted reviewers answering with the fake's
+ground truth resolved all 9,000; refit and routing refresh on those review labels gave the
+same thresholds as day 7; then 2,000 more decisions per question, of which 4,024 went to
+review and were resolved. 13,024 resolutions in total, no `409`, no item claimed twice.
+Verify-tier agreement on `refund.eligible` was 70.8% (95% interval 68.3% to 73.1%),
+consistent with the 71.2% the day 7 run measured for that band directly.
+
+**Honest gaps:**
+
+- Reviewers are identified by a free-text `reviewer` field. There is no authentication or
+  authorization yet, so anyone who can reach the API can resolve items; this needs to sit
+  behind an authenticating proxy until the service has its own auth.
+- SLAs are global per tier, not per question; per-question SLAs would belong in the
+  routing policy file, but adding fields there changes every policy fingerprint and makes
+  all rules stale, so it needs a separate section rather than new policy fields.
+- Nothing escalates or alerts on an overdue item yet; the stats show it. Alerts arrive
+  with the drift webhook (day 9).
+- Review labels are treated as ground truth. A second-reviewer audit (double-labeling a
+  sample to measure reviewer error) is not implemented.
+- The real run's SLA figures are trivial because the reviewers are a script.
+
+**Tests:** 559 passing locally on Python 3.13 against SQLite and a local PostgreSQL 16
+server (67 new), 100% line and branch coverage. New:
+enqueueing on decide and on replay; per-tier deadlines; earliest-deadline-first order and
+filters; leases that lapse and renew; release rules; ten concurrent claims over six items
+on both databases; confirm, correct and decide verdicts; idempotent and conflicting
+resolutions; resolving after someone's lease lapsed and without a claim; invalid answers;
+superseding by an outcome from elsewhere; overdue filtering and stats with a controlled
+clock; backfill; and the CLI workflow and its error exits.
+
+**Next (day 9):** drift monitoring: rolling-window ECE, PSI on the score distribution and
+the outcome-label rate, automatic threshold tightening and a webhook alert.
