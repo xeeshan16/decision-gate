@@ -452,3 +452,86 @@ clock; backfill; and the CLI workflow and its error exits.
 
 **Next (day 9):** drift monitoring: rolling-window ECE, PSI on the score distribution and
 the outcome-label rate, automatic threshold tightening and a webhook alert.
+
+## Day 9 (2026-11-06): drift monitoring
+
+CI on main was green from day 8, so the day went to the milestone.
+
+**Shipped:**
+
+- `decision_gate.drift`: population stability index over quantile bins of the reference
+  (open-ended outer bins, merged ties, an epsilon floor so an empty bin cannot make it
+  infinite; rank-based, so the same on raw and monotonically calibrated scores),
+  categorical PSI for the outcome mix, and the drift policy.
+- `decision_gate.drift_monitor`: one check per question version compares the current
+  window with a reference window that ends where the active routing rule was selected.
+  Four signals: `score_psi` (every decision, no labels needed), `label_psi` (outcome
+  mix), `ece` (window's labeled decisions under the active calibrator, judged on the
+  lower end of a 95% bootstrap interval) and `auto_error` (labeled decisions above the
+  auto threshold; drift only when the lower confidence bound on their error rate is over
+  the policy's budget).
+- Automatic tightening: on drift, the auto threshold is re-selected on the window's labels
+  alone and installed only if stricter; with too few labels or no threshold meeting the
+  budget, the auto tier is suspended. The tightened rule keeps the old rule's policy
+  fingerprint and calibrator, links to its check (`routing_rules.drift_check_id`), and
+  replaces the old rule only if it is still active, in the same transaction as the check.
+- A routing refresh no longer undoes a tightening while the latest check still reports
+  drift (it keeps the stricter auto threshold); after an `ok` check it may loosen again.
+  The router says when the auto tier is suspended and by which check.
+- Signed webhook alerts (`decision_gate.alerts`): HMAC-SHA256 signature header, a
+  delivery id stable across retries, retries with backoff on timeouts, 5xx and 429.
+  Alerts go out on entering drift, on a routing change and on recovery; the outcome
+  (`sent`, `failed`, `unconfigured`) is stored on the check.
+- Drift settings in a `drift:` section of the routing file with per-question overrides,
+  kept out of policy fingerprints so tuning them never invalidates a rule.
+- Migration `0006` (`drift_checks`, `routing_rules.drift_check_id`); `POST /v1/drift/check`,
+  `GET /v1/drift/status`, `GET /v1/drift/checks[/{id}]`; `dgate drift check` (exit 3 on
+  drift, `--at` for backfills) and `dgate drift list`; CI smoke-tests the drift endpoints
+  and CLI against PostgreSQL.
+
+**Real run (in the README):** PostgreSQL 16 through the HTTP API. 3,000 decisions per
+question from the fake at overconfidence 2.0, all labeled, then refit and refresh. Then
+the fake was switched to overconfidence 5.0 and 3,000 more decisions per question were
+routed on the old thresholds, labeled only through the review queue (2,174 items). The
+check flagged both questions on `score_psi`, `ece` and `auto_error` (for
+`refund.eligible`, 17 of 108 labeled auto-tier decisions wrong, at least 10.3% at 95%
+confidence against a 10% budget), left `label_psi` quiet (the ground truth did not
+change), suspended both auto tiers and delivered two signed alerts. The next 500
+decisions per question had no auto decisions, and a refresh that would have re-automated
+`refund.eligible` kept the suspension.
+
+**Plan note:** the plan's "outcome-label rate" is implemented as the outcome mix (PSI of
+the true answers). The share of decisions that are labeled is reported in every check's
+summary (with the tier split) but not alerted on, because it mostly reflects routing and
+review throughput rather than drift.
+
+**Honest gaps:**
+
+- Detection power is limited by labels. A test with a model that is wrong about 4% more
+  often did not trip `auto_error` or `ece` on 3,000 window decisions; it is tightened only
+  when another signal fires. The verify sample rate is the lever.
+- ECE and the outcome-mix PSI are computed on labeled decisions, which are mostly the
+  review queue's hard cases. Calibration given a score is unaffected by which scores get
+  labeled, but the mix is, so `label_psi` can move when routing changes even if the world
+  did not. Comparing like with like (both windows labeled the same way) helps; it is not
+  enforced.
+- Nothing runs the checks on a schedule yet; use cron with `dgate drift check` until the
+  Compose worker (day 13).
+- Overdue review items still do not alert (noted on day 8); the webhook exists now, so this
+  is a small follow-up.
+- Recovery is not automatic: an `ok` check sends `drift.recovered` but leaves routing
+  tightened until someone runs a refresh, by design.
+
+**Tests:** 640 passing locally on Python 3.13 against SQLite and a local PostgreSQL 16
+server (81 new), 100% line and branch coverage. New: hand-computed PSI fixtures,
+monotone invariance, open bins and ties; drift config parsing and fingerprint isolation;
+each signal's branches; monitor runs for steady traffic, a broken model (tighten, route,
+alert), persistent drift without a second alert then recovery, refresh keeping a
+suspension and a raised threshold until drift clears, a score shift without labels, labels
+that vindicate the threshold, a slightly worse model getting a higher threshold, alert-only
+policy, failed and unconfigured alerts, no rule, raw scores, a calibrator that cannot
+score, and a rule replaced mid-check; webhook signing, retries and error handling; API and
+CLI.
+
+**Next (day 10):** shadow mode: run a candidate backend or prompt version in shadow and
+compare calibrated performance before promoting it.

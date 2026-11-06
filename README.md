@@ -47,7 +47,8 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Automation thresholds that meet a precision target with Clopper-Pearson or Wilson bounds (fixed-sequence testing), and split-conformal prediction sets (LAC, APS) for choice and predicate questions | ✅ day 6 |
 | Routing tiers (auto, verify, human) from a per-question YAML policy: an error budget, minimum sample sizes, verify sampling and conformal answer sets; thresholds stored as audited rules that fail closed when the policy or calibrator changes | ✅ day 7 |
 | Human review queue: every verify and human decision is enqueued with an SLA deadline; reviewers claim (leased, `SKIP LOCKED`), release and resolve; a resolution is recorded as the decision's outcome in the same transaction; backlog, SLA and agreement stats | ✅ day 8 |
-| Drift detection, shadow mode, simulator, observability | planned (days 9-12) |
+| Drift monitoring: score PSI, outcome-mix PSI, windowed ECE with a bootstrap interval and the auto tier's observed error rate; automatic threshold tightening or suspension that a refresh will not undo while drift lasts; signed webhook alerts | ✅ day 9 |
+| Shadow mode, simulator, observability | planned (days 10-12) |
 
 ## Architecture
 
@@ -713,6 +714,119 @@ What it shows, and what it does not:
 decisions recorded before the queue existed; their deadlines count from the decision time,
 so they arrive overdue, which is the truth about how long they waited.
 
+### Drift monitoring
+
+Thresholds are selected on yesterday's traffic and applied to today's. A drift check
+compares two windows of stored decisions for one question version:
+
+- the **current window**: the last `window_hours` (default a week);
+- the **reference window**: `reference_hours` long (default four weeks), ending where the
+  active routing rule was selected, or where the current window starts if that is
+  earlier. The thresholds in force were chosen on traffic like the reference, so that is
+  what today's traffic has to resemble.
+
+Four signals, each `ok`, `drift` or `insufficient` (too little data to say):
+
+| Signal | What it measures | Needs labels | Fires when |
+| --- | --- | --- | --- |
+| `score_psi` | Population stability index of the backend's raw confidence over every decision, in quantile bins of the reference. Rank-based, so it reads the same on calibrated scores | no | PSI > `max_score_psi` (0.25) |
+| `label_psi` | PSI of the true answers among labeled decisions (the outcome mix). Not for score questions | yes | PSI > `max_label_psi` (0.25) |
+| `ece` | Calibration error of the window's labeled decisions, scored with the active calibrator, with a 95% bootstrap interval | yes | the interval's *lower* end > `max_ece` (0.05): small samples inflate ECE, so the point estimate alone would cry wolf |
+| `auto_error` | Error rate of the window's labeled decisions that clear the active auto threshold. These labels come mostly from the random verify sample, so they are an unbiased look at the auto tier | yes | the lower confidence bound on the error rate (the policy's bound and confidence) exceeds the policy's `max_error_rate`: the budget is *confidently* broken |
+
+A check is `drift` if any signal drifted. With `action: tighten` (the default) the monitor
+then re-selects the auto threshold **on the current window's labels alone** and installs
+it only if it is stricter than the one in force. When the window has too few labels to
+select anything (a score shift seen before labels arrive), or no threshold meets the
+budget on recent traffic, the auto tier is **suspended**: the new rule has no auto
+threshold, so those decisions go to verify or to a human. If the window's labels support
+the current threshold, nothing changes (`not_tightened`). The tightened rule keeps the
+policy fingerprint and calibrator of the rule it replaces, so the router applies it at
+once; it records which check installed it (`drift_check_id`), and it replaces the old rule
+only if that rule is still the active one, in the same transaction as the check is stored.
+
+A routing refresh selects on every label, most of them from before the drift, so on its
+own it would undo the tightening. While the latest check for a question still says
+`drift`, a refresh keeps the stricter of the two auto thresholds. Once a check comes back
+`ok`, the next refresh may loosen again.
+
+**Alerts.** Set `DGATE_DRIFT_WEBHOOK_URL` and the monitor POSTs JSON when a question enters
+drift, when it changes routing, and when a drifting question checks out `ok` again
+(`drift.detected`, `drift.recovered`); repeated checks of the same drift stay quiet. With
+`DGATE_DRIFT_WEBHOOK_SECRET` set, `X-Dgate-Signature: sha256=<hex>` is the HMAC-SHA256 of
+the body. `X-Dgate-Delivery` is unique per alert and stable across retries; timeouts, 5xx
+and 429 are retried with backoff. Whether the alert was `sent`, `failed` or
+`unconfigured` is stored on the check.
+
+Drift settings live in a `drift:` section of the routing file (see
+[`examples/routing.yaml`](examples/routing.yaml)), with per-question overrides. They are
+deliberately not part of any routing policy, so tuning a limit never changes a policy
+fingerprint and never sends traffic to a human. Run checks on a schedule with
+`dgate drift check` (exit status 3 when anything drifts, so a cron job can flag it) or
+`POST /v1/drift/check`.
+
+A real run against PostgreSQL 16, through the HTTP API. Phase 1: 3,000 decisions per
+question from the fake backend at its default miscalibration, every one labeled by an
+outcome event, then `refit` and `routing refresh`. Phase 2: the backend is "updated" to a
+much more overconfident model (`DGATE_FAKE_OVERCONFIDENCE` 2.0 to 5.0) and 3,000 more
+decisions per question are routed with the phase 1 thresholds; the only labels are the
+review queue's, resolved by a scripted reviewer (2,174 items: the verify and human tiers
+plus the 5% verify sample of automatable decisions). Then one drift check, with windows
+shrunk to fit a run that took minutes and a local webhook receiver:
+
+```console
+$ curl -s -X POST localhost:8088/v1/drift/check -H 'content-type: application/json' -d '{}'
+refund.eligible  drift  action suspended  alert sent (drift.detected)
+  score_psi   drift  confidence PSI 0.852 > 0.25 (mean 0.848 -> 0.934)
+  label_psi   ok     outcome PSI 0.000 <= 0.25 (largest change: 'true' 48.1% -> 48.7%)
+  ece         drift  ECE 0.092 (95% interval 0.067 to 0.118) on 918 labeled decisions,
+                     lower end above 0.05; mean calibrator v1 score 0.697 vs accuracy 0.605
+  auto_error  drift  17 of 108 labeled decisions above the auto threshold 0.8054 were wrong
+                     (15.7%); at 95% confidence the error rate is at least 10.3%, above the
+                     10.0% budget
+  -> auto tier suspended (was 0.8054): no threshold on the window's labels: even the highest
+     threshold 0.8501 has a 95% lower bound of 0.8013 on precision (87/100), below the
+     target 0.9000
+ticket.queue  drift  action suspended  alert sent (drift.detected)
+  score_psi   drift  confidence PSI 1.267 > 0.25 (mean 0.792 -> 0.924)
+  label_psi   ok     outcome PSI 0.002 <= 0.25 (largest change: 'other' 19.5% -> 20.9%)
+  ece         drift  ECE 0.238 (95% interval 0.214 to 0.264) on 1256 labeled decisions,
+                     lower end above 0.05; mean calibrator v1 score 0.617 vs accuracy 0.379
+  auto_error  drift  16 of 77 labeled decisions above the auto threshold 0.8888 were wrong
+                     (20.8%); at 95% confidence the error rate is at least 13.5%, above the
+                     5.0% budget
+  -> auto tier suspended (was 0.8888): no threshold on the window's labels: even the highest
+     threshold 0.8828 has a 95% lower bound of 0.6687 on precision (75/100), below the
+     target 0.9500
+```
+
+(The JSON response, condensed to its signal messages.) The receiver got two
+`drift.detected` alerts, both with valid signatures. The next 500 decisions per question:
+
+| Question | Tiers in phase 2 (old thresholds) | Tiers after the check |
+| --- | --- | --- |
+| `refund.eligible` | 2,082 auto, 845 verify, 73 human | 0 auto, 488 verify, 12 human |
+| `ticket.queue` | 1,744 auto, 605 verify, 651 human | 0 auto, 405 verify, 95 human |
+
+A `routing refresh` right after the check, on all 4,000-odd labels, would have
+re-automated `refund.eligible`; it kept the suspension instead:
+`auto threshold suspended: drift check 52cc9d50-... still reports drift; scores from
+calibrator v1 (temperature); auto: accept ...`.
+
+What the run does and does not show:
+
+- Phase 2 automated 2,082 `refund.eligible` decisions with a threshold that no longer
+  held: on the 108 that were labeled, 15.7% were wrong against a 10% budget. The check
+  catches that from the verify sample alone, without labeling the auto tier.
+- The label mix did not move (the fake's ground truth is the same in both phases), and
+  `label_psi` correctly stayed quiet.
+- The ECE is measured on labeled decisions, which here are mostly the hard cases the
+  review queue sees. Calibration *given a score* is unaffected by which scores get
+  labeled, but the ECE weights its bins by the labeled mix, so it is not the ECE of all
+  traffic. The `auto_error` check is the one tied to the error budget.
+- The windows were minutes long because the whole run was; the defaults are a week
+  against the four weeks before the rule.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -740,6 +854,9 @@ so they arrive overdue, which is the truth about how long they waited.
 | `POST /v1/reviews/{id}/resolve` | Resolve with `{"reviewer", "outcome"}` or `{"reviewer", "confirm": true}`; the answer becomes the decision's outcome. `201` resolved, `200` same resolution replayed, `409` conflict, `422` invalid answer |
 | `GET /v1/reviews/stats` | Backlog, overdue count, SLA hit rate, median and p90 resolution time, and backend agreement with a Wilson interval, per question version and tier (`?question=`, `?since=`) |
 | `POST /v1/reviews/backfill` | Enqueue verify and human decisions recorded before the queue existed |
+| `POST /v1/drift/check` | Run drift checks for one question (`{"question": ...}`) or every monitored one (`{}`); tightens routing and sends alerts per the drift policy. `404` unknown or unmonitored question |
+| `GET /v1/drift/status` | The latest drift check of every monitored question version |
+| `GET /v1/drift/checks`, `GET /v1/drift/checks/{id}` | Check history with every signal, the action taken and the alert outcome, newest first (`?question=`, `?version=`, `?status=`) |
 
 ## Backends
 
@@ -764,6 +881,10 @@ never a silently stored decision.
 | `DGATE_REVIEW_VERIFY_SLA_MINUTES` | `60` | Deadline for resolving a verify item |
 | `DGATE_REVIEW_HUMAN_SLA_MINUTES` | `240` | Deadline for resolving a human item |
 | `DGATE_REVIEW_CLAIM_MINUTES` | `15` | How long a claim lasts before the item returns to the queue |
+| `DGATE_DRIFT_WEBHOOK_URL` | unset | Where drift alerts are POSTed; unset means checks record `unconfigured` |
+| `DGATE_DRIFT_WEBHOOK_SECRET` | unset | HMAC-SHA256 key for the `X-Dgate-Signature` header |
+| `DGATE_DRIFT_WEBHOOK_TIMEOUT_S` | `5` | Time limit for one webhook attempt |
+| `DGATE_DRIFT_WEBHOOK_ATTEMPTS` | `3` | Attempts per alert (timeouts, 5xx and 429 are retried) |
 | `DGATE_STORE_INPUTS` | `true` | Store decision inputs; when `false` only a SHA-256 of the input is kept |
 | `DGATE_BACKEND` | `fake` | `fake`, `http` or `llm_json` |
 | `DGATE_BACKEND_TIMEOUT_S` | `10` | Time limit for one backend call |
@@ -819,7 +940,9 @@ and checks the stats count it once, then checks calibration metrics over HTTP an
 and runs the refit job (skipped on one label) against the calibrator registry, threshold
 selection and a conformal fit over HTTP and the CLI, `dgate fake-gate`, `dgate routing
 check`, and routing: the first decision goes to a human because nothing is calibrated, and
-a refresh over HTTP stores a current rule for every question. The Kafka
+a refresh over HTTP stores a current rule for every question, the review queue round trip,
+and drift checks over HTTP and the CLI (too little data, so every signal is
+`insufficient` and routing is untouched). The Kafka
 source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License
