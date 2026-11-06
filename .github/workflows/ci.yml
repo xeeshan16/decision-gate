@@ -153,3 +153,11 @@ jobs:
             | jq -e '.queues[0].resolved == 1 and .queues[0].superseded == 1'
           .venv/bin/dgate reviews backfill | grep -q "enqueued 0"
           .venv/bin/dgate reviews stats
+          # Drift monitoring: two decisions are far too few for any signal, so every check
+          # is "insufficient", nothing is tightened and no alert is due.
+          curl -sf -X POST localhost:8080/v1/drift/check \
+            -H 'content-type: application/json' -d '{}' \
+            | jq -e '(.checks | length) == 3 and all(.checks[]; .status == "insufficient" and .action == "none" and .alert == null)'
+          curl -sf localhost:8080/v1/drift/status | jq -e 'all(.questions[]; .latest != null)'
+          .venv/bin/dgate drift check ticket.queue | grep -q "INSUFFICIENT"
+          .venv/bin/dgate drift list | grep -c "ticket.queue@v1" | grep -q 2
