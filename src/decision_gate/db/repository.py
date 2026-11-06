@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from decision_gate.db.models import (
     CalibratorRecord,
     DecisionRecord,
+    DriftCheckRecord,
     OutcomeRecord,
     ReviewItemRecord,
     RoutingRuleRecord,
@@ -65,6 +66,47 @@ class DecisionRepository:
                     raise
                 return existing, False
         return record, True
+
+    async def confidences(
+        self, question_id: str, question_version: int, *, since: datetime, until: datetime
+    ) -> list[float]:
+        """Raw backend confidence of every decision in ``[since, until)``, labeled or not."""
+        query = select(DecisionRecord.confidence).where(
+            DecisionRecord.question_id == question_id,
+            DecisionRecord.question_version == question_version,
+            DecisionRecord.created_at >= since,
+            DecisionRecord.created_at < until,
+        )
+        async with self._sessions() as session:
+            result = await session.execute(query)
+            return [float(value) for value in result.scalars().all()]
+
+    async def window_counts(
+        self, question_id: str, question_version: int, *, since: datetime, until: datetime
+    ) -> dict[str, int]:
+        """Decisions in ``[since, until)`` by tier, plus how many of them are labeled."""
+        query = (
+            select(
+                DecisionRecord.tier,
+                func.count(DecisionRecord.id),
+                func.count(OutcomeRecord.decision_id),
+            )
+            .outerjoin(OutcomeRecord, OutcomeRecord.decision_id == DecisionRecord.id)
+            .where(
+                DecisionRecord.question_id == question_id,
+                DecisionRecord.question_version == question_version,
+                DecisionRecord.created_at >= since,
+                DecisionRecord.created_at < until,
+            )
+            .group_by(DecisionRecord.tier)
+        )
+        counts = {"decisions": 0, "labeled": 0}
+        async with self._sessions() as session:
+            for tier, total, labeled in (await session.execute(query)).all():
+                counts["decisions"] += int(total)
+                counts["labeled"] += int(labeled)
+                counts[f"tier_{tier or 'none'}"] = int(total)
+        return counts
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +531,111 @@ class RoutingRuleRepository:
             f"could not store a routing rule for {record.question_key} after "
             f"{self.MAX_ATTEMPTS} attempts (concurrent refreshes)"
         )
+
+
+class DriftCheckRepository:
+    """Drift checks, and the tightened routing rules they install."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def get(self, check_id: uuid.UUID) -> DriftCheckRecord | None:
+        async with self._sessions() as session:
+            return await session.get(DriftCheckRecord, check_id)
+
+    async def latest(self, question_id: str, question_version: int) -> DriftCheckRecord | None:
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(DriftCheckRecord)
+                .where(
+                    DriftCheckRecord.question_id == question_id,
+                    DriftCheckRecord.question_version == question_version,
+                )
+                .order_by(DriftCheckRecord.checked_at.desc(), DriftCheckRecord.id.desc())
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
+    async def find(
+        self,
+        *,
+        question_id: str | None = None,
+        question_version: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[DriftCheckRecord]:
+        """Newest check first."""
+        query = (
+            select(DriftCheckRecord)
+            .order_by(DriftCheckRecord.checked_at.desc(), DriftCheckRecord.id.desc())
+            .limit(limit)
+        )
+        if question_id is not None:
+            query = query.where(DriftCheckRecord.question_id == question_id)
+        if question_version is not None:
+            query = query.where(DriftCheckRecord.question_version == question_version)
+        if status is not None:
+            query = query.where(DriftCheckRecord.status == status)
+        async with self._sessions() as session:
+            return list((await session.execute(query)).scalars().all())
+
+    async def add(
+        self, check: DriftCheckRecord, rule: RoutingRuleRecord | None = None
+    ) -> tuple[DriftCheckRecord, bool]:
+        """Store a check, and the tightened rule it produced. Returns ``(check, installed)``.
+
+        The rule replaces ``check.previous_rule_id`` in the same transaction as the check is
+        stored, and only if that rule is still the active one. If a refresh or another check
+        replaced it in the meantime, tightening a rule that is no longer in force would
+        overwrite newer thresholds, so the rule is dropped, the check records ``skipped``
+        and ``installed`` is ``False``.
+        """
+        async with self._sessions() as session:
+            installed = False
+            if rule is not None:
+                retired = await session.execute(
+                    update(RoutingRuleRecord)
+                    .where(
+                        RoutingRuleRecord.id == check.previous_rule_id,
+                        RoutingRuleRecord.status == "active",
+                    )
+                    .values(status="retired")
+                )
+                if retired.rowcount == 1:  # type: ignore[attr-defined]
+                    rule.status = "active"
+                    session.add(rule)
+                    await session.flush()
+                    installed = True
+                else:
+                    check.action = "skipped"
+                    check.action_reason = (
+                        "the routing rule changed while the check ran; nothing was tightened"
+                    )
+                    check.rule_id = None
+            session.add(check)
+            try:
+                await session.commit()
+            except IntegrityError:  # pragma: no cover - needs an exact race on the rule
+                await session.rollback()
+                check.action = "skipped"
+                check.action_reason = "a concurrent rule change won; nothing was tightened"
+                check.rule_id = None
+                async with self._sessions() as retry:
+                    retry.add(check)
+                    await retry.commit()
+                return check, False
+        return check, installed
+
+    async def set_alert(
+        self, check_id: uuid.UUID, *, alert: str, event: str, error: str | None = None
+    ) -> None:
+        async with self._sessions() as session:
+            await session.execute(
+                update(DriftCheckRecord)
+                .where(DriftCheckRecord.id == check_id)
+                .values(alert=alert, alert_event=event, alert_error=error and error[:500])
+            )
+            await session.commit()
 
 
 class ReviewNotFoundError(LookupError):

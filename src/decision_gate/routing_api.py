@@ -43,6 +43,9 @@ class RuleOut(BaseModel):
     reason: str
     evaluation: dict[str, Any]
     created_at: datetime
+    drift_check_id: uuid.UUID | None = Field(
+        default=None, description="The drift check that tightened this rule, if any."
+    )
 
     @classmethod
     def from_record(cls, record: RoutingRuleRecord) -> RuleOut:
@@ -62,6 +65,7 @@ class RuleOut(BaseModel):
             reason=record.reason,
             evaluation=record.evaluation,
             created_at=_utc(record.created_at),
+            drift_check_id=record.drift_check_id,
         )
 
 

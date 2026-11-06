@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from decision_gate.alerts import WebhookAlerter
 from decision_gate.reviews import ReviewSla
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://dgate:dgate@localhost:5432/dgate"
@@ -43,6 +44,14 @@ class Settings(BaseSettings):
         gt=0,
         description="How long a claim lasts before the item returns to the queue.",
     )
+    drift_webhook_url: str | None = Field(
+        default=None, description="Where drift alerts are POSTed. Unset: alerts are not sent."
+    )
+    drift_webhook_secret: SecretStr | None = Field(
+        default=None, description="HMAC-SHA256 key for the X-Dgate-Signature header."
+    )
+    drift_webhook_timeout_s: float = Field(default=5.0, gt=0)
+    drift_webhook_attempts: int = Field(default=3, ge=1, le=10)
     store_inputs: bool = Field(
         default=True,
         description="Keep each decision's input. When false only its SHA-256 hash is stored.",
@@ -82,7 +91,7 @@ class Settings(BaseSettings):
 
     log_level: Literal["debug", "info", "warning", "error"] = "info"
 
-    @field_validator("kafka_dead_letter_topic")
+    @field_validator("kafka_dead_letter_topic", "drift_webhook_url")
     @classmethod
     def _empty_is_none(cls, value: str | None) -> str | None:
         return value or None
@@ -96,6 +105,18 @@ class Settings(BaseSettings):
                 "DGATE_LLM_BASE_URL and DGATE_LLM_MODEL are required when DGATE_BACKEND=llm_json"
             )
         return self
+
+    def drift_alerter(self) -> WebhookAlerter | None:
+        if not self.drift_webhook_url:
+            return None
+        return WebhookAlerter(
+            self.drift_webhook_url,
+            secret=self.drift_webhook_secret.get_secret_value()
+            if self.drift_webhook_secret
+            else None,
+            timeout_s=self.drift_webhook_timeout_s,
+            attempts=self.drift_webhook_attempts,
+        )
 
     @property
     def review_sla(self) -> ReviewSla:

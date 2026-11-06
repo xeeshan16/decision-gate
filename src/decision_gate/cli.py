@@ -54,6 +54,11 @@ routing_app = typer.Typer(
     help="Routing tiers: check policies, refresh rules, show status.", no_args_is_help=True
 )
 app.add_typer(routing_app, name="routing")
+drift_app = typer.Typer(
+    help="Drift monitoring: run checks (tightening routing on drift), list results.",
+    no_args_is_help=True,
+)
+app.add_typer(drift_app, name="drift")
 reviews_app = typer.Typer(
     help="The human review queue: list, claim, resolve and measure.", no_args_is_help=True
 )
@@ -1097,6 +1102,7 @@ async def _refresh(database_url: str, config: Any, targets: list[Any]) -> list[A
     from decision_gate.db import make_engine, make_sessionmaker
     from decision_gate.db.repository import (
         CalibratorRepository,
+        DriftCheckRepository,
         OutcomeRepository,
         RoutingRuleRepository,
     )
@@ -1112,6 +1118,7 @@ async def _refresh(database_url: str, config: Any, targets: list[Any]) -> list[A
             GateAnalyzer(OutcomeRepository(sessions), calibrators),
             calibrators,
             RoutingRuleRepository(sessions),
+            DriftCheckRepository(sessions),
         )
         return [(await refresher.refresh(q)).rule for q in targets]
     finally:
@@ -1420,3 +1427,142 @@ def reviews_backfill(url: DatabaseURL = None) -> None:
         return int(await service.backfill())
 
     typer.echo(f"enqueued {_run_review(url, work)} decision(s)")
+
+
+# --- Drift monitoring --------------------------------------------------------------------
+
+
+async def _with_drift(database_url: str, config: Any, work: Any) -> Any:
+    from decision_gate.config import Settings
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import (
+        CalibratorRepository,
+        DecisionRepository,
+        DriftCheckRepository,
+        OutcomeRepository,
+        RoutingRuleRepository,
+    )
+    from decision_gate.drift_monitor import DriftMonitor
+    from decision_gate.selection import GateAnalyzer
+
+    engine = make_engine(database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        outcomes = OutcomeRepository(sessions)
+        calibrators = CalibratorRepository(sessions)
+        checks = DriftCheckRepository(sessions)
+        monitor = DriftMonitor(
+            config,
+            decisions=DecisionRepository(sessions),
+            outcomes=outcomes,
+            calibrators=calibrators,
+            rules=RoutingRuleRepository(sessions),
+            checks=checks,
+            analyzer=GateAnalyzer(outcomes, calibrators),
+            alerter=Settings().drift_alerter(),
+        )
+        return await work(monitor, checks)
+    finally:
+        await engine.dispose()
+
+
+def _print_check(check: Any, *, verbose: bool = True) -> None:
+    from decision_gate.reviews import as_utc
+
+    alert = f", alert {check.alert_event} {check.alert}" if check.alert else ""
+    checked = as_utc(check.checked_at)
+    typer.echo(
+        f"{check.question_key}: {check.status.upper()} at {checked:%Y-%m-%d %H:%M}Z "
+        f"(window {as_utc(check.window_start):%m-%d %H:%M} to "
+        f"{as_utc(check.window_end):%m-%d %H:%M}, reference "
+        f"{as_utc(check.reference_start):%m-%d %H:%M} to "
+        f"{as_utc(check.reference_end):%m-%d %H:%M}); action {check.action}{alert}"
+    )
+    if not verbose:
+        return
+    for signal in check.signals:
+        typer.echo(f"  {signal['name']:<10} {signal['status']:<12} {signal['message']}")
+    if check.action != "none":
+        typer.echo(f"  -> {check.action_reason}")
+    if check.alert_error:
+        typer.echo(f"  alert error: {check.alert_error}")
+
+
+@drift_app.command("check")
+def drift_check(
+    question: Annotated[
+        str | None, typer.Argument(help="Question id. Omit to check every monitored question.")
+    ] = None,
+    version: Annotated[int | None, typer.Option(min=1, help="Question version.")] = None,
+    at: Annotated[
+        str | None,
+        typer.Option(help="Evaluate as of this ISO 8601 time instead of now (e.g. backfills)."),
+    ] = None,
+    routing: RoutingPath = None,
+    questions: OptionalCatalogPath = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Measure drift; on drift, tighten routing (per the drift policy) and send alerts.
+
+    Exits with status 3 when any question is drifting, so a scheduler can flag it.
+    A running server caches rules for DGATE_ROUTING_CACHE_TTL_S seconds.
+    """
+    from decision_gate.selection import SelectionError
+
+    config = _routing_config(routing)
+    catalog = _catalog_for_ingest(questions)
+    if question is not None:
+        targets = [_question(question, version, questions)]
+    else:
+        targets = list(catalog.questions)
+    now = None
+    if at is not None:
+        try:
+            now = datetime.fromisoformat(at)
+        except ValueError as exc:
+            typer.echo(f"error: --at is not an ISO 8601 time: {at}", err=True)
+            raise typer.Exit(code=2) from exc
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+
+    async def work(monitor: Any, _checks: Any) -> list[Any]:
+        if question is not None:
+            return [await monitor.check(targets[0], now=now)]
+        return list(await monitor.check_all(targets, now=now))
+
+    try:
+        records = asyncio.run(_with_drift(_database_url(url), config, work))
+    except SelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if not records:
+        typer.echo("no monitored questions (drift needs a routing policy)")
+        return
+    for record in records:
+        _print_check(record)
+    if any(r.status == "drift" for r in records):
+        raise typer.Exit(code=3)
+
+
+@drift_app.command("list")
+def drift_list(
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    status: Annotated[str | None, typer.Option(help="ok, drift or insufficient.")] = None,
+    limit: Annotated[int, typer.Option(min=1, max=10_000)] = 20,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show every signal.")] = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Drift check history, newest first."""
+    from decision_gate.routing import RoutingConfig
+
+    _check_choice(status, ("ok", "drift", "insufficient"), "--status")
+
+    async def work(_monitor: Any, checks: Any) -> list[Any]:
+        return list(await checks.find(question_id=question, status=status, limit=limit))
+
+    records = asyncio.run(_with_drift(_database_url(url), RoutingConfig(), work))
+    if not records:
+        typer.echo("no drift checks")
+        return
+    for record in records:
+        _print_check(record, verbose=verbose)

@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from decision_gate import __version__
+from decision_gate.alerts import AlertSink
 from decision_gate.backends import DecisionBackend
 from decision_gate.backends.base import BackendError
 from decision_gate.backends.factory import build_backend
@@ -28,11 +29,14 @@ from decision_gate.db.repository import (
     ActivationConflictError,
     CalibratorRepository,
     DecisionRepository,
+    DriftCheckRepository,
     LabelStats,
     OutcomeRepository,
     ReviewRepository,
     RoutingRuleRepository,
 )
+from decision_gate.drift_api import drift_router
+from decision_gate.drift_monitor import DriftMonitor
 from decision_gate.gating_api import gating_router
 from decision_gate.metrics import BinStrategy, ReliabilityBin
 from decision_gate.questions import Answer, QuestionCatalog
@@ -385,6 +389,7 @@ def create_app(
     engine: AsyncEngine | None = None,
     routing: RoutingConfig | None = None,
     clock: Clock = utc_now,
+    alerter: AlertSink | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     if catalog is None:
@@ -700,14 +705,29 @@ def create_app(
         router.invalidate()
         return CalibratorOut.from_record(record)
 
+    drift_repository = DriftCheckRepository(sessions)
+    monitor = DriftMonitor(
+        routing,
+        decisions=repository,
+        outcomes=outcome_repository,
+        calibrators=calibrator_repository,
+        rules=rule_repository,
+        checks=drift_repository,
+        analyzer=analyzer,
+        alerter=alerter if alerter is not None else settings.drift_alerter(),
+        clock=clock,
+    )
     app.include_router(reviews_router(review_service))
     app.include_router(gating_router(catalog, analyzer))
     app.include_router(
         routing_router(
             catalog,
             router,
-            RoutingRefresher(routing, analyzer, calibrator_repository, rule_repository),
+            RoutingRefresher(
+                routing, analyzer, calibrator_repository, rule_repository, drift_repository
+            ),
             rule_repository,
         )
     )
+    app.include_router(drift_router(catalog, monitor, drift_repository, router))
     return app

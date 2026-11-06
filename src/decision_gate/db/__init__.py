@@ -12,6 +12,7 @@ from decision_gate.db.models import (
     Base,
     CalibratorRecord,
     DecisionRecord,
+    DriftCheckRecord,
     OutcomeRecord,
     ReviewItemRecord,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "Base",
     "CalibratorRecord",
     "DecisionRecord",
+    "DriftCheckRecord",
     "OutcomeRecord",
     "ReviewItemRecord",
     "make_engine",

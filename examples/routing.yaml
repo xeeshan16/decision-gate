@@ -29,3 +29,19 @@ questions:
 
   ticket.handling_minutes:
     max_error_rate: 0.20        # an estimate within 15 minutes, 80% of the time
+
+# Drift monitoring (`dgate drift check`, `POST /v1/drift/check`). Not part of any policy
+# fingerprint, so tuning these never invalidates a routing rule.
+drift:
+  window_hours: 168        # current window: the last week of decisions
+  reference_hours: 672     # four weeks before the active rule was selected
+  min_decisions: 200       # per window, for the score PSI
+  min_labeled: 100         # per window, for the outcome PSI and the ECE
+  min_auto_labeled: 30     # labeled decisions above the auto threshold, for the error check
+  max_score_psi: 0.25      # > 0.25 is a major shift in the confidence distribution
+  max_label_psi: 0.25
+  max_ece: 0.05            # judged on the lower end of a bootstrap interval
+  action: tighten          # raise or suspend the auto threshold on drift; or 'alert'
+  questions:
+    ticket.handling_minutes:
+      action: alert        # score question: only alert, a person retunes it

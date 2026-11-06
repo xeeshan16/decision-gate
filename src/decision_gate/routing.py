@@ -45,7 +45,12 @@ from decision_gate.calibrators import (
 )
 from decision_gate.conformal import ConformalError, ConformalMethod, ConformalPredictor
 from decision_gate.db.models import CalibratorRecord, RoutingRuleRecord
-from decision_gate.db.repository import CalibratorRepository, RoutingRuleRepository
+from decision_gate.db.repository import (
+    CalibratorRepository,
+    DriftCheckRepository,
+    RoutingRuleRepository,
+)
+from decision_gate.drift import DriftConfig, DriftConfigError, parse_drift
 from decision_gate.questions import Answer, ChoiceQuestion, QuestionCatalog, ScoreQuestion
 from decision_gate.selection import AnyQuestion, GateAnalyzer, SelectionError
 
@@ -136,6 +141,7 @@ class RoutingConfig(BaseModel):
 
     default: RoutingPolicy | None = None
     questions: dict[str, RoutingPolicy] = Field(default_factory=dict)
+    drift: DriftConfig = Field(default_factory=DriftConfig)
 
     def policy_for(self, question_id: str) -> RoutingPolicy | None:
         return self.questions.get(question_id, self.default)
@@ -143,7 +149,7 @@ class RoutingConfig(BaseModel):
     def unknown_questions(self, catalog: QuestionCatalog) -> list[str]:
         """Policies that name a question the catalog does not have (likely a typo)."""
         known = {q.id for q in catalog.questions}
-        return sorted(set(self.questions) - known)
+        return sorted((set(self.questions) | set(self.drift.questions)) - known)
 
 
 def parse_routing(raw: Any, *, source: str = "<data>") -> RoutingConfig:
@@ -152,13 +158,15 @@ def parse_routing(raw: Any, *, source: str = "<data>") -> RoutingConfig:
     The file has an optional ``defaults`` mapping (fields shared by every policy), an
     optional ``default`` policy for unlisted questions (``default: {}`` routes every
     question with the defaults; leave it out and unlisted questions always go to a human),
-    and ``questions``, a mapping of question id to policy overrides.
+    and ``questions``, a mapping of question id to policy overrides. An optional ``drift``
+    section configures drift monitoring (see :func:`decision_gate.drift.parse_drift`);
+    it is not part of any policy fingerprint.
     """
     if raw is None:
         return RoutingConfig()
     if not isinstance(raw, dict):
         raise RoutingConfigError(f"{source}: expected a mapping")
-    unknown = set(raw) - {"defaults", "default", "questions"}
+    unknown = set(raw) - {"defaults", "default", "questions", "drift"}
     if unknown:
         raise RoutingConfigError(f"{source}: unknown keys {sorted(unknown)}")
     shared = raw.get("defaults") or {}
@@ -170,7 +178,11 @@ def parse_routing(raw: Any, *, source: str = "<data>") -> RoutingConfig:
         data["default"] = {**shared, **(raw["default"] or {})}
     data["questions"] = {qid: {**shared, **(policy or {})} for qid, policy in questions.items()}
     try:
-        return RoutingConfig.model_validate(data)
+        drift = parse_drift(raw.get("drift"), source=source)
+    except DriftConfigError as exc:
+        raise RoutingConfigError(str(exc)) from exc
+    try:
+        return RoutingConfig.model_validate(data).model_copy(update={"drift": drift})
     except ValidationError as exc:
         raise RoutingConfigError(f"{source}: invalid routing policy\n{exc}") from exc
 
@@ -215,11 +227,13 @@ class RoutingRefresher:
         analyzer: GateAnalyzer,
         calibrators: CalibratorRepository,
         rules: RoutingRuleRepository,
+        drift_checks: DriftCheckRepository | None = None,
     ) -> None:
         self._config = config
         self._analyzer = analyzer
         self._calibrators = calibrators
         self._rules = rules
+        self._drift_checks = drift_checks
 
     async def active_calibrator_id(self, question: AnyQuestion) -> uuid.UUID | None:
         record = await self._calibrators.active(question.id, question.version)
@@ -230,6 +244,7 @@ class RoutingRefresher:
         if policy is None:
             raise SelectionError(f"no routing policy covers {question.id}")
         rule = await self._select(question, policy)
+        await self._respect_drift(question, rule)
         stored = await self._rules.add_active(rule)
         return RefreshResult(question_key=question.key, rule=stored)
 
@@ -316,6 +331,46 @@ class RoutingRefresher:
 
         rule.reason = _clip(f"scores from {scores}; " + "; ".join(notes), 1000)
         return rule
+
+    async def _respect_drift(self, question: AnyQuestion, rule: RoutingRuleRecord) -> None:
+        """Never loosen a threshold that drift tightened while the drift is still there.
+
+        A refresh selects on every labeled decision, most of them from before the drift, so
+        on its own it would undo the tightening. While the latest drift check for the
+        question still says ``drift``, the new rule keeps the stricter of the two auto
+        thresholds (no threshold is the strictest). Once a check comes back ``ok``, a
+        refresh may loosen again.
+        """
+        if self._drift_checks is None:
+            return
+        active = await self._rules.active(question.id, question.version)
+        if active is None or active.drift_check_id is None:
+            return
+        latest = await self._drift_checks.latest(question.id, question.version)
+        if latest is None or latest.status != "drift":
+            return
+        if active.calibrator_id != rule.calibrator_id:
+            # A new calibrator changes what the scores mean; the old floor does not apply.
+            return
+        floor = active.auto_threshold
+        if floor is None:
+            stricter: float | None = None
+        elif rule.auto_threshold is None:
+            stricter = None
+        else:
+            stricter = max(floor, rule.auto_threshold)
+        if stricter == rule.auto_threshold:
+            rule.drift_check_id = active.drift_check_id
+            return
+        rule.auto_threshold = stricter
+        if rule.verify_threshold is not None and stricter is not None:
+            rule.verify_threshold = min(rule.verify_threshold, stricter)
+        rule.drift_check_id = active.drift_check_id
+        kept = "suspended" if stricter is None else f"kept at {stricter:.4f}"
+        rule.reason = _clip(
+            f"auto threshold {kept}: drift check {latest.id} still reports drift; " + rule.reason,
+            1000,
+        )
 
 
 def _clip(text: str, limit: int) -> str:
@@ -490,7 +545,9 @@ class Router:
                 f"{label} {score:.4f} >= verify threshold {rule.verify_threshold:.4f}",
             )
         if rule.auto_threshold is None:
-            if rule.eligible < policy.min_labeled:
+            if rule.drift_check_id is not None:
+                why = f"the auto tier is suspended after drift check {rule.drift_check_id}"
+            elif rule.eligible < policy.min_labeled:
                 why = (
                     f"only {rule.eligible} eligible labeled decisions "
                     f"(min_labeled {policy.min_labeled})"
