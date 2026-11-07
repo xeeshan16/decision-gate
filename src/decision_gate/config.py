@@ -79,6 +79,44 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
 
+    shadow_backend: Literal["fake", "http", "llm_json"] | None = Field(
+        default=None,
+        description="Candidate backend answered in shadow next to the primary. Unset: off.",
+    )
+    shadow_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="Name the candidate's answers are stored under, e.g. 'gpt-x-prompt-v3'. "
+        "Defaults to the shadow backend type.",
+    )
+    shadow_sample_rate: float = Field(
+        default=1.0, ge=0, le=1, description="Fraction of new decisions shadowed."
+    )
+    shadow_questions: str = Field(
+        default="", description="Comma-separated question ids to shadow. Empty: all."
+    )
+    shadow_timeout_s: float = Field(default=10.0, gt=0, description="Per-call time limit.")
+    shadow_max_pending: int = Field(
+        default=100, ge=1, description="Most shadow calls in flight; beyond it, skip."
+    )
+    shadow_fake_overconfidence: float = Field(default=1.0, gt=0)
+    shadow_fake_min_skill: float | None = Field(
+        default=None,
+        gt=0,
+        lt=1,
+        description="Lowest probability of a correct answer for the fake candidate; higher "
+        "makes a more accurate model.",
+    )
+    shadow_fake_seed: str = "decision-gate"
+    shadow_fake_model_version: str = "fake-2"
+    shadow_http_url: str | None = None
+    shadow_http_token: SecretStr | None = None
+    shadow_llm_base_url: str | None = None
+    shadow_llm_model: str | None = None
+    shadow_llm_api_key: SecretStr | None = None
+    shadow_llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
     kafka_bootstrap_servers: str = Field(
         default="localhost:9092", description="Kafka brokers for the outcome consumer."
     )
@@ -90,6 +128,11 @@ class Settings(BaseSettings):
     )
 
     log_level: Literal["debug", "info", "warning", "error"] = "info"
+
+    @field_validator("shadow_backend", "shadow_name", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value: object) -> object:
+        return None if value == "" else value
 
     @field_validator("kafka_dead_letter_topic", "drift_webhook_url")
     @classmethod
@@ -104,7 +147,25 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DGATE_LLM_BASE_URL and DGATE_LLM_MODEL are required when DGATE_BACKEND=llm_json"
             )
+        if self.shadow_backend == "http" and not self.shadow_http_url:
+            raise ValueError("DGATE_SHADOW_HTTP_URL is required when DGATE_SHADOW_BACKEND=http")
+        if self.shadow_backend == "llm_json" and not (
+            self.shadow_llm_base_url and self.shadow_llm_model
+        ):
+            raise ValueError(
+                "DGATE_SHADOW_LLM_BASE_URL and DGATE_SHADOW_LLM_MODEL are required when "
+                "DGATE_SHADOW_BACKEND=llm_json"
+            )
         return self
+
+    @property
+    def shadow_candidate(self) -> str | None:
+        """The configured candidate's name: ``DGATE_SHADOW_NAME``, else the backend type."""
+        return self.shadow_name or self.shadow_backend
+
+    @property
+    def shadow_question_ids(self) -> list[str]:
+        return [q.strip() for q in self.shadow_questions.split(",") if q.strip()]
 
     def drift_alerter(self) -> WebhookAlerter | None:
         if not self.drift_webhook_url:

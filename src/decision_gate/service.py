@@ -25,6 +25,7 @@ from decision_gate.db.repository import DecisionRepository, OutcomeRepository
 from decision_gate.questions import Answer, QuestionCatalog
 from decision_gate.reviews import ReviewSla
 from decision_gate.routing import Router
+from decision_gate.shadow_runner import ShadowRunner
 
 MAX_REASON_LENGTH = 500
 
@@ -52,6 +53,7 @@ class DecisionService:
         store_inputs: bool = True,
         router: Router | None = None,
         review_sla: ReviewSla | None = None,
+        shadow: ShadowRunner | None = None,
     ) -> None:
         self._backend = backend
         self._repository = repository
@@ -59,6 +61,7 @@ class DecisionService:
         self._store_inputs = store_inputs
         self._router = router
         self._review_sla = review_sla
+        self._shadow = shadow
 
     async def decide(
         self,
@@ -115,6 +118,9 @@ class DecisionService:
         stored, created = await self._repository.add(record, review)
         if not created:
             self._check_replay(stored, question, digest)
+        elif self._shadow is not None:
+            # In the background, after the decision is stored (the shadow row references it).
+            self._shadow.submit(question, stored.id, data)
         return stored, created
 
     @staticmethod

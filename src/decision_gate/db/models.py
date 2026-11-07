@@ -295,3 +295,48 @@ class DriftCheckRecord(Base):
     @property
     def question_key(self) -> str:
         return f"{self.question_id}@v{self.question_version}"
+
+
+class ShadowDecisionRecord(Base):
+    """What a candidate backend answered for a decision it did not make.
+
+    The primary backend's decision is what the caller got and what was routed; the
+    candidate answered the same input on the side (``mode='live'``) or later, replaying
+    stored inputs (``mode='replay'``). A candidate never affects a response. Its answer is
+    scored against the primary decision's outcome when that arrives, so the two models are
+    compared on exactly the same inputs and the same ground truth. ``status`` is ``ok``,
+    ``error`` or ``timeout``; failures are kept because a candidate that fails more often
+    is not ready to be promoted however good its answers are.
+    """
+
+    __tablename__ = "shadow_decisions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    decision_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("decisions.id", ondelete="CASCADE")
+    )
+    candidate: Mapped[str] = mapped_column(String(64))
+    mode: Mapped[str] = mapped_column(String(16))
+    question_id: Mapped[str] = mapped_column(String(64))
+    question_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16))
+    answer: Mapped[Any] = mapped_column(JSONType, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    probabilities: Mapped[dict[str, float] | None] = mapped_column(JSONType)
+    backend: Mapped[str | None] = mapped_column(String(64))
+    model_version: Mapped[str | None] = mapped_column(String(200))
+    latency_ms: Mapped[float] = mapped_column(Float)
+    error: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
+    )
+
+    __table_args__ = (
+        # One answer per candidate per decision, so retries and replays never double count.
+        UniqueConstraint("decision_id", "candidate"),
+        Index(None, "question_id", "question_version", "candidate"),
+    )
+
+    @property
+    def question_key(self) -> str:
+        return f"{self.question_id}@v{self.question_version}"
