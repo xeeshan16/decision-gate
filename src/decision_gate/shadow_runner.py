@@ -206,11 +206,15 @@ class ShadowRunner:
             limit=limit,
         )
         gate = asyncio.Semaphore(concurrency)
+        # Candidate calls run concurrently; writes go one at a time. A replay is a batch
+        # job, and concurrent writers only contend (SQLite even rejects them as locked).
+        writes = asyncio.Lock()
 
         async def one(decision_id: uuid.UUID, data: dict[str, Any]) -> tuple[str, bool]:
             async with gate:
                 record = await self.answer(question, decision_id, data, "replay")
-            _stored, created = await self._repository.add(record)
+            async with writes:
+                _stored, created = await self._repository.add(record)
             return record.status, created
 
         results = await asyncio.gather(*(one(t.decision_id, t.input) for t in targets))
