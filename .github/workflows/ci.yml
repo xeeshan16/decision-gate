@@ -77,6 +77,8 @@ jobs:
           DGATE_DATABASE_URL: ${{ env.DGATE_TEST_DATABASE_URL }}
           DGATE_QUESTIONS_FILE: examples/questions.yaml
           DGATE_ROUTING_FILE: examples/routing.yaml
+          DGATE_SHADOW_BACKEND: fake
+          DGATE_SHADOW_NAME: fake-2
         run: |
           uv run dgate db downgrade base
           uv run dgate db upgrade
@@ -161,3 +163,15 @@ jobs:
           curl -sf localhost:8080/v1/drift/status | jq -e 'all(.questions[]; .latest != null)'
           .venv/bin/dgate drift check ticket.queue | grep -q "INSUFFICIENT"
           .venv/bin/dgate drift list | grep -c "ticket.queue@v1" | grep -q 2
+          # Shadow mode: the fake candidate answered both new decisions on the side (not
+          # the idempotent replay), both are labeled, and two pairs are too few to compare.
+          curl -sf localhost:8080/v1/shadow/status \
+            | jq -e '.shadow.candidate == "fake-2" and .candidates[0].ok == 2 and .candidates[0].labeled == 2'
+          curl -sf "localhost:8080/v1/shadow/decisions/$second" | jq -e '.answers[0].status == "ok"'
+          curl -sf 'localhost:8080/v1/shadow/compare?question=ticket.queue' \
+            | jq -e '.verdict == "insufficient" and .paired == 2'
+          .venv/bin/dgate shadow replay ticket.queue | grep -q "0 replayed"
+          .venv/bin/dgate shadow status | grep -q "fake-2"
+          verdict=0
+          .venv/bin/dgate shadow compare ticket.queue || verdict=$?
+          test "$verdict" = 4

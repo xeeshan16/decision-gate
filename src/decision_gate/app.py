@@ -18,7 +18,7 @@ from decision_gate import __version__
 from decision_gate.alerts import AlertSink
 from decision_gate.backends import DecisionBackend
 from decision_gate.backends.base import BackendError
-from decision_gate.backends.factory import build_backend
+from decision_gate.backends.factory import build_backend, build_shadow_backend
 from decision_gate.calibration import CalibrationReport, GroupField, build_reports
 from decision_gate.calibrators import CalibrationError
 from decision_gate.catalog import load_catalog
@@ -35,6 +35,7 @@ from decision_gate.db.repository import (
     ReviewRepository,
     RoutingRuleRepository,
 )
+from decision_gate.db.shadow import ShadowRepository
 from decision_gate.drift_api import drift_router
 from decision_gate.drift_monitor import DriftMonitor
 from decision_gate.gating_api import gating_router
@@ -62,6 +63,8 @@ from decision_gate.service import (
     OutcomeService,
     UnknownDecisionError,
 )
+from decision_gate.shadow_api import shadow_router
+from decision_gate.shadow_runner import ShadowRunner
 
 MAX_OUTCOME_BATCH = 1000
 
@@ -390,6 +393,7 @@ def create_app(
     routing: RoutingConfig | None = None,
     clock: Clock = utc_now,
     alerter: AlertSink | None = None,
+    shadow_backend: DecisionBackend | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     if catalog is None:
@@ -414,6 +418,19 @@ def create_app(
         calibrator_repository,
         cache_ttl_s=settings.routing_cache_ttl_s,
     )
+    shadow_repository = ShadowRepository(sessions)
+    shadow_backend = shadow_backend or build_shadow_backend(settings)
+    shadow: ShadowRunner | None = None
+    if shadow_backend is not None:
+        shadow = ShadowRunner(
+            shadow_backend,
+            shadow_repository,
+            candidate=settings.shadow_candidate or shadow_backend.name,
+            timeout_s=settings.shadow_timeout_s,
+            sample_rate=settings.shadow_sample_rate,
+            questions=settings.shadow_question_ids,
+            max_pending=settings.shadow_max_pending,
+        )
     service = DecisionService(
         backend,
         repository,
@@ -421,6 +438,7 @@ def create_app(
         store_inputs=settings.store_inputs,
         router=router,
         review_sla=settings.review_sla,
+        shadow=shadow,
     )
     review_service = ReviewService(
         catalog, ReviewRepository(sessions), settings.review_sla, clock=clock
@@ -429,6 +447,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
+        if shadow is not None:
+            await shadow.drain(timeout_s=settings.shadow_timeout_s)
+            await shadow.aclose()
         close = getattr(backend, "aclose", None)
         if close is not None:
             await close()
@@ -446,6 +467,7 @@ def create_app(
     app.state.engine = engine
     app.state.outcome_service = outcome_service
     app.state.router = router
+    app.state.shadow = shadow
 
     @app.get("/healthz", tags=["ops"])
     async def healthz() -> dict[str, str]:
@@ -730,4 +752,5 @@ def create_app(
         )
     )
     app.include_router(drift_router(catalog, monitor, drift_repository, router))
+    app.include_router(shadow_router(catalog, shadow_repository, routing, shadow))
     return app

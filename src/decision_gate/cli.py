@@ -63,6 +63,11 @@ reviews_app = typer.Typer(
     help="The human review queue: list, claim, resolve and measure.", no_args_is_help=True
 )
 app.add_typer(reviews_app, name="reviews")
+shadow_app = typer.Typer(
+    help="Shadow mode: a candidate backend answers on the side; compare it before promoting.",
+    no_args_is_help=True,
+)
+app.add_typer(shadow_app, name="shadow")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -1566,3 +1571,198 @@ def drift_list(
         return
     for record in records:
         _print_check(record, verbose=verbose)
+
+
+# --- Shadow mode --------------------------------------------------------------------------
+
+
+async def _with_shadow(database_url: str, work: Any, *, runner: bool = False) -> Any:
+    from decision_gate.backends.factory import build_shadow_backend
+    from decision_gate.config import Settings
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.shadow import ShadowRepository
+    from decision_gate.shadow_runner import ShadowRunner
+
+    engine = make_engine(database_url)
+    shadow: ShadowRunner | None = None
+    try:
+        repository = ShadowRepository(make_sessionmaker(engine))
+        if runner:
+            settings = Settings()
+            backend = build_shadow_backend(settings)
+            if backend is None:
+                typer.echo("error: set DGATE_SHADOW_BACKEND to choose a candidate", err=True)
+                raise typer.Exit(code=2)
+            shadow = ShadowRunner(
+                backend,
+                repository,
+                candidate=settings.shadow_candidate or backend.name,
+                timeout_s=settings.shadow_timeout_s,
+            )
+        return await work(repository, shadow)
+    finally:
+        if shadow is not None:
+            await shadow.aclose()
+        await engine.dispose()
+
+
+def _optional_routing(path: Path | None) -> Any:
+    from decision_gate.config import Settings
+    from decision_gate.routing import RoutingConfig
+
+    if path is None and Settings().routing_file is None:
+        return RoutingConfig()
+    return _routing_config(path)
+
+
+@shadow_app.command("status")
+def shadow_status(
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Stored shadow answers per question version and candidate."""
+
+    async def work(repository: Any, _runner: Any) -> list[Any]:
+        return list(await repository.summaries(question_id=question))
+
+    summaries = asyncio.run(_with_shadow(_database_url(url), work))
+    if not summaries:
+        typer.echo("no shadow answers")
+        return
+    typer.echo(
+        f"{'question':<28} {'candidate':<20} {'total':>7} {'ok':>7} {'failed':>7} {'labeled':>8}"
+    )
+    for s in summaries:
+        typer.echo(
+            f"{s.question_id + '@v' + str(s.question_version):<28} {s.candidate:<20} "
+            f"{s.total:>7} {s.ok:>7} {s.errors + s.timeouts:>7} {s.labeled:>8}"
+        )
+
+
+@shadow_app.command("replay")
+def shadow_replay(
+    question: Annotated[str, typer.Argument(help="Question id.")],
+    version: Annotated[int | None, typer.Option(min=1, help="Question version.")] = None,
+    limit: Annotated[int, typer.Option(min=1, max=1_000_000)] = 1000,
+    labeled_only: Annotated[
+        bool,
+        typer.Option("--labeled-only/--all", help="Only decisions that have an outcome."),
+    ] = True,
+    concurrency: Annotated[int, typer.Option(min=1, max=64)] = 8,
+    questions: OptionalCatalogPath = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Run the configured candidate (DGATE_SHADOW_*) over stored decisions, oldest first."""
+    target = _question(question, version, questions)
+
+    async def work(_repository: Any, runner: Any) -> Any:
+        return await runner.replay(
+            target, limit=limit, labeled_only=labeled_only, concurrency=concurrency
+        )
+
+    result = asyncio.run(_with_shadow(_database_url(url), work, runner=True))
+    typer.echo(
+        f"{result.question_id}@v{result.question_version} {result.candidate}: "
+        f"{result.attempted} replayed, {result.ok} ok, {result.failed} failed, "
+        f"{result.duplicates} already answered, "
+        f"{result.skipped_without_input} skipped (no stored input)"
+    )
+
+
+def _print_side(label: str, side: Any) -> None:
+    auto = side.auto
+    threshold = "none" if auto.threshold is None else f"{auto.threshold:.3f}"
+    typer.echo(
+        f"  {label:<10} {side.method:<12} raw ece {side.raw['ece']:.3f}  "
+        f"calibrated ece {side.calibrated['ece']:.3f}  brier {side.calibrated['brier']:.3f}  "
+        f"accuracy {side.calibrated['accuracy']:.3f}  auto {auto.coverage:.1%} "
+        f"(threshold {threshold})  p95 {_fmt(side.latency_p95_ms, '.1f')} ms"
+    )
+
+
+@shadow_app.command("compare")
+def shadow_compare(
+    question: Annotated[str, typer.Argument(help="Question id.")],
+    candidate: Annotated[
+        str | None,
+        typer.Option(help="Candidate name. Defaults to DGATE_SHADOW_NAME or the backend type."),
+    ] = None,
+    version: Annotated[int | None, typer.Option(min=1, help="Question version.")] = None,
+    mode: Annotated[str | None, typer.Option(help="Only 'live' or only 'replay' answers.")] = None,
+    holdout: Annotated[float, typer.Option(min=0.05, max=0.95)] = 0.5,
+    method: Annotated[str, typer.Option(help="auto, platt, isotonic or temperature.")] = "auto",
+    min_paired: Annotated[int, typer.Option(min=40)] = 200,
+    alpha: Annotated[float, typer.Option(min=0.001, max=0.5)] = 0.05,
+    min_coverage_gain: Annotated[float, typer.Option(min=0.0, max=0.99)] = 0.02,
+    max_failure_rate: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.01,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the full report as JSON.")] = False,
+    routing: RoutingPath = None,
+    questions: OptionalCatalogPath = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Compare a candidate with the primary backend on paired, labeled decisions.
+
+    Exits 0 on 'promote', 3 on 'keep' and 4 on 'insufficient', so a pipeline can gate a
+    rollout on it.
+    """
+    from decision_gate.calibrators import CalibrationError
+    from decision_gate.config import Settings
+    from decision_gate.refit import METHOD_CHOICES
+    from decision_gate.shadow import ShadowCompareError, compare_stored
+    from decision_gate.shadow_api import comparison_out
+
+    _check_choice(mode, ("live", "replay"), "--mode")
+    _check_choice(method, METHOD_CHOICES, "--method")
+    target = _question(question, version, questions)
+    config = _optional_routing(routing)
+    name = candidate or Settings().shadow_candidate
+    if name is None:
+        typer.echo("error: pass --candidate or set DGATE_SHADOW_NAME", err=True)
+        raise typer.Exit(code=2)
+
+    async def work(repository: Any, _runner: Any) -> Any:
+        return await compare_stored(
+            repository,
+            target,
+            name,
+            policy=config.policy_for(target.id),
+            mode=mode,
+            holdout=holdout,
+            method=method,
+            min_paired=min_paired,
+            alpha=alpha,
+            min_coverage_gain=min_coverage_gain,
+            max_failure_rate=max_failure_rate,
+        )
+
+    try:
+        result = asyncio.run(_with_shadow(_database_url(url), work))
+    except (ShadowCompareError, CalibrationError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo(json.dumps(comparison_out(result), indent=2, default=str))
+    else:
+        typer.echo(
+            f"{result.question_key} primary vs {result.candidate}: {result.verdict.upper()} "
+            f"({result.paired} paired: {result.train} train, {result.holdout} held out)"
+        )
+        for reason in result.reasons:
+            typer.echo(f"  - {reason}")
+        if result.accuracy is not None:
+            a = result.accuracy
+            low, high = a.interval
+            typer.echo(
+                f"  accuracy delta {a.delta:+.3f} [{low:+.3f}, {high:+.3f}]  "
+                f"primary-only {a.primary_only}, candidate-only {a.candidate_only}, "
+                f"p={a.p_value:.3g}"
+            )
+        if result.primary is not None and result.challenger is not None:
+            _print_side("primary", result.primary)
+            _print_side("candidate", result.challenger)
+        if result.reliability is not None:
+            r = result.reliability
+            typer.echo(f"  candidate failures {r.failures}/{r.total} ({r.rate:.1%})")
+    codes = {"promote": 0, "keep": 3, "insufficient": 4}
+    if codes[result.verdict]:
+        raise typer.Exit(code=codes[result.verdict])
