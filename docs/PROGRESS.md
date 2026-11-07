@@ -535,3 +535,80 @@ CLI.
 
 **Next (day 10):** shadow mode: run a candidate backend or prompt version in shadow and
 compare calibrated performance before promoting it.
+
+## Day 10 (2026-11-07): shadow mode
+
+CI on main was green from day 9, so the day went to the milestone.
+
+**Shipped:**
+
+- `decision_gate.shadow_runner`: after a new decision is stored, a configured candidate
+  backend (`DGATE_SHADOW_BACKEND`, any of fake, http or llm_json, named by
+  `DGATE_SHADOW_NAME`) answers the same input in a background task. It never touches the
+  response: timeouts, exceptions and invalid answers are stored as `timeout` or `error`.
+  Bounded in-flight work (`DGATE_SHADOW_MAX_PENDING`, excess counted as `dropped`), a
+  sample rate hashed from the decision id with its own salt (independent of verify
+  sampling, so not biased towards any tier), a question filter, in-process counters,
+  and a drain with a timeout on shutdown. Idempotent replays are not shadowed again.
+- Replay: run the candidate over stored, labeled decisions it has not answered, oldest
+  first, with bounded concurrency. Decisions stored without their input (which hold JSON
+  `null`, not SQL `NULL`; the query handles both) are counted and skipped.
+- Migration `0007` (`shadow_decisions`, one row per decision and candidate, enforced by a
+  unique constraint) and `ShadowRepository` (paired rows, per-candidate summaries, replay
+  targets).
+- `decision_gate.shadow`: the comparison. Pairs are split by time; each side gets its own
+  calibrator fitted on the older half (`auto` chooses the method on an inner split of that
+  half) and is scored on the newer half: McNemar's exact test and a paired interval for
+  accuracy, the router's fixed-sequence threshold selection under the question's routing
+  policy for auto-tier coverage, plus raw and calibrated ECE, Brier, log loss and latency
+  percentiles. Verdict `promote` / `keep` / `insufficient` with the reasons, including a
+  failure-rate gate. The binomial CDF reuses the incomplete beta from `bounds`.
+- `GET /v1/shadow/status`, `GET /v1/shadow/decisions/{id}`, `POST /v1/shadow/replay`,
+  `GET /v1/shadow/compare`; `dgate shadow status | replay | compare` (compare exits 0, 3 or
+  4 by verdict). CI smoke-tests the endpoints and CLI against PostgreSQL with a fake
+  candidate on the server.
+
+**Real run (in the README):** PostgreSQL 16 through the HTTP API, 3,000 decisions per
+question shadowed live (6,000 submitted and completed, none dropped) and labeled. A
+candidate with a higher skill floor but *worse* raw calibration was promoted on both
+questions: `refund.eligible` +12.3% accuracy (McNemar p=8.2e-56) and auto coverage 65.1%
+against 31.2% at the 10% budget; `ticket.queue` +25.9% and 23.3% against 9.5% at 5%. A
+second candidate replayed over the same 3,000 stored decisions (same model, overconfidence
+4.0) was kept: raw ECE 0.159 against 0.098, but identical accuracy and coverage after
+calibration.
+
+**Plan note:** "before promoting it" is implemented as a verdict, not an automatic switch.
+Backends are configured by environment, and the active calibrator and routing rule belong
+to the question version rather than to a model, so switching the backend at runtime
+without a refit would route the new model's scores through the old model's calibrator.
+The README says to refit and refresh routing right after promoting.
+
+**Honest gaps:**
+
+- No calibrator is fitted for the candidate in the registry on promotion; the comparison
+  reports its calibrator parameters, but the first refit after the switch should use
+  only the new model's decisions. Calibrators keyed by model version would fix this
+  properly.
+- In the fake, both models share a seed, so the candidate is right wherever the primary
+  is (`primary-only 0`). The test handles disagreement in both directions (covered by the
+  synthetic-pair tests); the demo just does not show it.
+- Auto-tier coverage is selected and evaluated on the same held-out half for both sides.
+  It is a fair comparison, not an estimate of production coverage.
+- Live shadow calls run in the API process. Under heavy load a separate worker consuming
+  decisions from a queue would isolate the candidate further; `max_pending` bounds the
+  damage meanwhile.
+- Shadow answers are not visible in `GET /v1/decisions/{id}`; they have their own endpoint.
+
+**Tests:** 684 passing locally on Python 3.13 against SQLite and a local PostgreSQL 16
+server (44 new), 100% line and branch coverage. New: binomial CDF against exact sums,
+McNemar and the paired interval against hand-computed values; comparisons that promote a
+better candidate, keep an identical, a worse, an unreliable and a less-automating one,
+and report too few pairs; method choice with and without distributions; sampling
+independence from verify sampling; backpressure, drain timeouts, timeouts, exceptions,
+invalid answers and storage failures in the runner; idempotent storage and replay
+(including a lost race and decisions without inputs); settings and the backend factory;
+API and CLI, including that `/v1/decide` still answers when the candidate fails.
+
+**Next (day 11):** simulator: synthetic ticket-triage and refund-eligibility datasets with
+known ground truth and injected miscalibration and drift; `dgate simulate` produces real
+reports.

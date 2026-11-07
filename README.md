@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 6 of a 14-day build). See
+> **Status:** under active development (day 10 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -48,7 +48,8 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Routing tiers (auto, verify, human) from a per-question YAML policy: an error budget, minimum sample sizes, verify sampling and conformal answer sets; thresholds stored as audited rules that fail closed when the policy or calibrator changes | ✅ day 7 |
 | Human review queue: every verify and human decision is enqueued with an SLA deadline; reviewers claim (leased, `SKIP LOCKED`), release and resolve; a resolution is recorded as the decision's outcome in the same transaction; backlog, SLA and agreement stats | ✅ day 8 |
 | Drift monitoring: score PSI, outcome-mix PSI, windowed ECE with a bootstrap interval and the auto tier's observed error rate; automatic threshold tightening or suspension that a refresh will not undo while drift lasts; signed webhook alerts | ✅ day 9 |
-| Shadow mode, simulator, observability | planned (days 10-12) |
+| Shadow mode: a candidate backend answers live traffic in the background (or replays stored decisions); both are calibrated identically and compared on the same labeled decisions with McNemar's exact test and auto-tier coverage under the routing policy, for a `promote` / `keep` / `insufficient` verdict | ✅ day 10 |
+| Simulator, observability | planned (days 11-12) |
 
 ## Architecture
 
@@ -63,6 +64,7 @@ flowchart LR
     outcomes[Outcomes<br/>HTTP or Kafka] --> store[(PostgreSQL)]
     queue --> outcomes
     api --> store
+    api -.->|in the background| shadow[Shadow candidate] -.-> store
     store --> refit[Refit worker] --> cal
     store --> drift[Drift monitor] --> policy
 ```
@@ -827,6 +829,111 @@ What the run does and does not show:
 - The windows were minutes long because the whole run was; the defaults are a week
   against the four weeks before the rule.
 
+### Shadow mode
+
+Swapping the model behind a question (a new version, a new prompt, another vendor) is the
+riskiest change this service sees: the calibrator and the thresholds were fitted to the old
+model's scores. Shadow mode answers "is the candidate better?" with the same evidence the
+gate already collects, before anything is switched.
+
+**Collecting.** Set `DGATE_SHADOW_BACKEND` (and `DGATE_SHADOW_NAME`, e.g. `prompt-v3`).
+After each new decision is stored, the candidate is asked the same input in a background
+task. It never affects the response: a slow, failing or invalid candidate is recorded as
+`timeout` or `error`, and `/v1/decide` answers exactly as before. At most
+`DGATE_SHADOW_MAX_PENDING` calls are in flight; beyond that decisions are not shadowed
+(counted as `dropped`) rather than queued without bound. `DGATE_SHADOW_SAMPLE_RATE`
+shadows a fraction of decisions by a hash of the decision id with its own salt, so the
+sample is reproducible and independent of verify sampling. Idempotent replays are not
+shadowed twice; each candidate answers each decision at most once.
+
+To compare without waiting for new traffic, `dgate shadow replay` (or `POST
+/v1/shadow/replay`) runs the candidate over stored decisions that already have outcomes,
+oldest first. It needs stored inputs (`DGATE_STORE_INPUTS`); decisions without one are
+counted and skipped.
+
+**Comparing.** A candidate's answers are scored against the primary decision's outcome,
+so both models are judged on the same inputs and the same ground truth. Raw confidences
+are not comparable across models, so each side is treated identically: the paired
+decisions are split by time, a calibrator is fitted to each side on the older half (`auto`
+picks the method with an inner split of that half, never by peeking at the rest), and the
+newer half is scored:
+
+- **Accuracy**, with McNemar's exact test: only the decisions where exactly one model was
+  right carry information, which makes paired comparison far more sensitive than two
+  separate accuracy figures. Reported with a paired 95% interval.
+- **Auto-tier coverage**: the router's own fixed-sequence threshold selection under the
+  question's routing policy, on each side's calibrated scores. Both sides are selected and
+  evaluated on the same held-out half, which flatters both equally; the difference is what
+  counts.
+- Raw and calibrated ECE, Brier and log loss, and latency percentiles, for information.
+  Per-answer Brier is not a verdict input: each model forecasts the correctness of its own
+  answer, which are different events.
+
+The verdict is `promote` only if the candidate's failure rate is within
+`max_failure_rate` (1%), it is not significantly less accurate, it does not automate more
+than `min_coverage_gain` (2 points) less, and it is either significantly more accurate or
+automates at least that much more. Otherwise `keep`, with the reasons; `insufficient`
+below `min_paired` (200) labeled pairs. `dgate shadow compare` exits 0, 3 or 4 for those, so
+a pipeline can gate a rollout on it. Promotion itself is a configuration change
+(`DGATE_BACKEND`); refit the calibrator and refresh routing right after it.
+
+**Real run** (PostgreSQL 16, through the HTTP API): the primary is the fake at
+overconfidence 2.0; the candidate `fake-2` is a fake with a higher skill floor
+(`DGATE_SHADOW_FAKE_MIN_SKILL=0.75`) and overconfidence 3.0. 3,000 decisions per question,
+every one shadowed live (6,000 submitted, 6,000 completed, none dropped), then all labeled
+through `/v1/outcomes/batch`:
+
+```console
+$ dgate shadow compare refund.eligible --candidate fake-2
+refund.eligible@v1 primary vs fake-2: PROMOTE (3000 paired: 1500 train, 1500 held out)
+  - significantly more accurate: +12.3% accuracy (McNemar p=8.16e-56)
+  - automates more: auto coverage 65.1% vs 31.2% at the error budget
+  accuracy delta +0.123 [+0.106, +0.139]  primary-only 0, candidate-only 184, p=8.16e-56
+  primary    temperature  raw ece 0.098  calibrated ece 0.011  brier 0.166  accuracy 0.759  auto 31.2% (threshold 0.840)  p95 0.1 ms
+  candidate  temperature  raw ece 0.111  calibrated ece 0.007  brier 0.100  accuracy 0.881  auto 65.1% (threshold 0.839)  p95 0.1 ms
+  candidate failures 0/3000 (0.0%)
+ticket.queue@v1 primary vs fake-2: PROMOTE (3000 paired: 1500 train, 1500 held out)
+  - significantly more accurate: +25.9% accuracy (McNemar p=1.59e-117)
+  - automates more: auto coverage 23.3% vs 9.5% at the error budget
+  accuracy delta +0.259 [+0.237, +0.282]  primary-only 0, candidate-only 389, p=1.59e-117
+  primary    platt        raw ece 0.176  calibrated ece 0.028  brier 0.187  accuracy 0.615  auto 9.5% (threshold 0.919)  p95 0.1 ms
+  candidate  temperature  raw ece 0.125  calibrated ece 0.017  brier 0.104  accuracy 0.875  auto 23.3% (threshold 0.938)  p95 0.1 ms
+  candidate failures 0/3000 (0.0%)
+```
+
+The candidate is *more* overconfident raw (ECE 0.111 against 0.098 on `refund.eligible`)
+and is still the better model once both are calibrated: it doubles the share of traffic
+that can be automated within the 10% error budget. `primary-only 0` is a property of the
+fake, not of the test: both fakes share a seed, so the candidate is right wherever the
+primary is; real models disagree in both directions, and McNemar uses both counts.
+
+A second candidate replayed over the same stored decisions: the same model, only louder
+(overconfidence 4.0, same skill):
+
+```console
+$ DGATE_SHADOW_BACKEND=fake DGATE_SHADOW_NAME=fake-loud DGATE_SHADOW_FAKE_OVERCONFIDENCE=4.0 \
+    dgate shadow replay refund.eligible --limit 5000
+refund.eligible@v1 fake-loud: 3000 replayed, 3000 ok, 0 failed, 0 already answered, 0 skipped (no stored input)
+$ dgate shadow status
+question                     candidate              total      ok  failed  labeled
+refund.eligible@v1           fake-2                  3000    3000       0     3000
+refund.eligible@v1           fake-loud               3000    3000       0     3000
+ticket.queue@v1              fake-2                  3000    3000       0     3000
+$ dgate shadow compare refund.eligible
+refund.eligible@v1 primary vs fake-loud: KEEP (3000 paired: 1500 train, 1500 held out)
+  - no meaningful improvement
+  - no significant accuracy difference: +0.0% accuracy (McNemar p=1)
+  - similar automation: auto coverage 31.2% vs 31.2% at the error budget
+  accuracy delta +0.000 [+0.000, +0.000]  primary-only 0, candidate-only 0, p=1
+  primary    temperature  raw ece 0.098  calibrated ece 0.011  brier 0.166  accuracy 0.759  auto 31.2% (threshold 0.840)  p95 0.1 ms
+  candidate  temperature  raw ece 0.159  calibrated ece 0.010  brier 0.166  accuracy 0.759  auto 31.2% (threshold 0.844)  p95 0.1 ms
+  candidate failures 0/3000 (0.0%)
+```
+
+Its raw calibration is much worse (ECE 0.159), but calibration removes the difference and
+it automates exactly as much, so it is kept: there is nothing to gain from switching, and
+a raw-calibration comparison would have called it worse when it is not.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -857,6 +964,10 @@ What the run does and does not show:
 | `POST /v1/drift/check` | Run drift checks for one question (`{"question": ...}`) or every monitored one (`{}`); tightens routing and sends alerts per the drift policy. `404` unknown or unmonitored question |
 | `GET /v1/drift/status` | The latest drift check of every monitored question version |
 | `GET /v1/drift/checks`, `GET /v1/drift/checks/{id}` | Check history with every signal, the action taken and the alert outcome, newest first (`?question=`, `?version=`, `?status=`) |
+| `GET /v1/shadow/status` | The configured candidate, its in-process counters (submitted, skipped, dropped, completed, failed) and stored answer counts per question version and candidate (`?question=`) |
+| `GET /v1/shadow/decisions/{id}` | Every candidate's answer to one decision |
+| `POST /v1/shadow/replay` | Run the configured candidate over stored decisions it has not answered (`{"question", "limit"?, "labeled_only"?}`). `409` when shadow mode is not configured |
+| `GET /v1/shadow/compare` | Paired comparison and verdict for one question (`?question=`, `?candidate=`, `?mode=live\|replay`, `?since=`, `?until=`, `?holdout=`, `?method=`, `?min_paired=`, `?alpha=`, `?min_coverage_gain=`, `?max_failure_rate=`). `422` for invalid options |
 
 ## Backends
 
@@ -894,6 +1005,15 @@ never a silently stored decision.
 | `DGATE_LLM_TEMPERATURE` | `0` | Sampling temperature for `llm_json` |
 | `DGATE_FAKE_OVERCONFIDENCE` | `2.0` | Fake backend miscalibration; `1.0` is perfectly calibrated |
 | `DGATE_FAKE_SEED` | `decision-gate` | Seed for the fake backend |
+| `DGATE_SHADOW_BACKEND` | unset | Candidate backend for shadow mode: `fake`, `http` or `llm_json`; unset turns shadow mode off |
+| `DGATE_SHADOW_NAME` | backend type | Name the candidate's answers are stored and compared under |
+| `DGATE_SHADOW_SAMPLE_RATE` | `1.0` | Fraction of new decisions shadowed |
+| `DGATE_SHADOW_QUESTIONS` | all | Comma-separated question ids to shadow |
+| `DGATE_SHADOW_TIMEOUT_S` | `10` | Time limit for one candidate call |
+| `DGATE_SHADOW_MAX_PENDING` | `100` | Most candidate calls in flight; decisions beyond it are not shadowed |
+| `DGATE_SHADOW_HTTP_URL`, `DGATE_SHADOW_HTTP_TOKEN` | unset | Endpoint and token for an `http` candidate |
+| `DGATE_SHADOW_LLM_BASE_URL`, `DGATE_SHADOW_LLM_MODEL`, `DGATE_SHADOW_LLM_API_KEY`, `DGATE_SHADOW_LLM_TEMPERATURE` | unset, `0` | An `llm_json` candidate |
+| `DGATE_SHADOW_FAKE_OVERCONFIDENCE`, `DGATE_SHADOW_FAKE_MIN_SKILL`, `DGATE_SHADOW_FAKE_SEED`, `DGATE_SHADOW_FAKE_MODEL_VERSION` | `1.0`, unset, `decision-gate`, `fake-2` | A `fake` candidate; a higher skill floor makes a more accurate model |
 | `DGATE_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Brokers for `dgate outcomes consume` |
 | `DGATE_KAFKA_OUTCOMES_TOPIC` | `dgate.outcomes` | Topic with outcome events |
 | `DGATE_KAFKA_GROUP_ID` | `decision-gate-outcomes` | Consumer group |

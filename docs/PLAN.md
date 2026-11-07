@@ -14,7 +14,7 @@ plan changes, this file is updated and the reason is logged in [PROGRESS.md](PRO
 | 7 | **Routing tiers.** YAML policy for each question (error budget, minimum sample count). Questions that aren't calibrated yet go to a human. Each response includes the calibrated probability, the tier and the reason. | done |
 | 8 | **Human review queue.** List, claim and resolve APIs with SLA timestamps. Resolutions feed back in as outcomes, which closes the loop. | done |
 | 9 | **Drift monitoring.** Rolling-window ECE, population stability index (PSI) on the score distribution, and outcome-label rate. Thresholds tighten automatically and a webhook alert fires when drift is detected. | done |
-| 10 | **Shadow mode.** Run a candidate backend or prompt version in shadow and compare calibrated performance before promoting it. | |
+| 10 | **Shadow mode.** Run a candidate backend or prompt version in shadow and compare calibrated performance before promoting it. | done |
 | 11 | **Simulator.** Synthetic ticket-triage and refund-eligibility datasets with known ground truth and deliberately injected miscalibration and drift. `dgate simulate` produces real reports. | |
 | 12 | **Observability and resilience.** Prometheus metrics, OpenTelemetry, backend timeouts and a circuit breaker that falls back to the human tier, plus rate limits. | |
 | 13 | **Docker Compose and end-to-end test.** API, worker, Postgres and optional Kafka. Reliability-diagram reports and a statistics write-up. | |
