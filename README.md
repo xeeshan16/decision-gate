@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 10 of a 14-day build). See
+> **Status:** under active development (day 11 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -49,7 +49,8 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Human review queue: every verify and human decision is enqueued with an SLA deadline; reviewers claim (leased, `SKIP LOCKED`), release and resolve; a resolution is recorded as the decision's outcome in the same transaction; backlog, SLA and agreement stats | ✅ day 8 |
 | Drift monitoring: score PSI, outcome-mix PSI, windowed ECE with a bootstrap interval and the auto tier's observed error rate; automatic threshold tightening or suspension that a refresh will not undo while drift lasts; signed webhook alerts | ✅ day 9 |
 | Shadow mode: a candidate backend answers live traffic in the background (or replays stored decisions); both are calibrated identically and compared on the same labeled decisions with McNemar's exact test and auto-tier coverage under the routing policy, for a `promote` / `keep` / `insufficient` verdict | ✅ day 10 |
-| Simulator, observability | planned (days 11-12) |
+| Simulator: synthetic refund and ticket traffic with known truth, segment-dependent miscalibration and injected drift, run through the real service, review queue, refit, routing refresh and drift monitor on a simulated clock; reports the auto tier's true error rate before and after drift (text, Markdown, JSON) | ✅ day 11 |
+| Observability, resilience, Docker Compose | planned (days 12-13) |
 
 ## Architecture
 
@@ -934,6 +935,116 @@ Its raw calibration is much worse (ECE 0.159), but calibration removes the diffe
 it automates exactly as much, so it is kept: there is nothing to gain from switching, and
 a raw-calibration comparison would have called it worse when it is not.
 
+### Simulator
+
+A gate like this is hard to judge in production, because the one number that matters, the
+auto tier's real error rate, is exactly what production cannot see: most automated
+decisions never get a label. `dgate simulate run` runs the whole system on synthetic
+traffic whose ground truth is known for every decision, and reports what really happened.
+
+Nothing is re-implemented for the simulation. Decisions go through the real
+`DecisionService` and router, reviews through the real queue, labels through outcome
+ingestion, and the refit job, routing refresh and drift monitor run as they would from a
+scheduler, against a real database (a temporary SQLite file, or PostgreSQL with
+`--database-url`). Only the clock, the traffic, the model and the people are simulated:
+
+- **Datasets** (`decision_gate.simulator.datasets`): refund requests judged by a written
+  returns policy (category, reason, opened, order age) and support tickets whose subject
+  determines the queue. Each item has a segment: `easy`, `hard` (near a policy boundary or
+  ambiguously worded) or `novel`.
+- **Drift**: after the steady phase the population changes without warning. Refunds get
+  holiday-season order ages and a new marketplace line with its own 14-day window;
+  tickets get a release that floods the technical queue with questions about a feature the
+  model has never seen.
+- **The model** (`SimulatedModel`) answers each segment with its own skill and
+  overconfidence: hard items with less skill and more bravado, novel ones at chance and
+  louder still. A calibrator fitted on one mix of segments is wrong for another, which is
+  what drift does to a deployed model.
+- **The timeline**: `history` days with no calibrator (everything goes to a person, whose
+  answers are the first labels), then a refit and the first routing rule, `steady` days of
+  routed traffic, then `drift` days. Reviewers resolve verify and human items within
+  their SLA; the true outcome of a share of auto decisions arrives a few days later. The
+  drift check runs every night, and the refit and refresh on a schedule.
+
+Same seed, same run: traffic, model answers and decision ids (which drive verify
+sampling) are all derived from the seed. A real run with the defaults (seed 7, 200
+decisions per question per day, 21 + 14 + 14 days; about three minutes on SQLite), first
+lines of each question's report:
+
+```text
+$ dgate simulate run --markdown report.md --json report.json
+refund.eligible@v1 (predicate, auto error budget 10%)
+  steady: 94.4% automated, true auto error 130/2643 = 4.9% (95% CI 4.1%-5.8%), within the 10% budget
+  drift from day 36: detected at the end of day 42 (7 day(s) of drifted traffic), auto tier suspended at the end of day 42
+  drift, until the action: true auto error 153/1332 = 11.5% (95% CI 9.8%-13.3%)
+  drift, after the action: nothing automated
+
+  phase       days decisions   auto verify  human hard+novel ECE raw ECE cal  true auto error
+  history    1-21       4200   0.0%   0.0% 100.0%      15.4%   0.043       -  -
+  steady    22-35       2800  94.4%   5.6%   0.0%      15.7%   0.045   0.007  130/2643 = 4.9% (95% CI 4.1%-5.8%)
+  drift     36-49       2800  47.6%  52.4%   0.0%      45.1%   0.092   0.034  153/1332 = 11.5% (95% CI 9.8%-13.3%)
+
+  [events omitted; daily rows from day 34, * = drifted traffic]
+    day  auto >=   auto  auto err  check
+     34   0.6667  95.5%      4.7%   ok
+     35   0.6667  94.5%      3.2%   ok
+     36   0.6667  96.5%     11.9%  *ok
+     37   0.6667  95.5%     13.1%  *ok
+     38   0.6667  96.0%      8.9%  *ok
+     39   0.6667  94.0%     11.7%  *ok
+     40   0.6667  95.5%     13.1%  *ok
+     41   0.6667  94.5%     10.1%  *ok
+     42   0.6667  94.0%     11.7%  *drift (label_psi) -> suspended
+     43        -   0.0%         -  *drift (label_psi)
+     44        -   0.0%         -  *drift (label_psi)
+     45        -   0.0%         -  *drift (label_psi)
+     46        -   0.0%         -  *ok
+     47        -   0.0%         -  *drift (label_psi)
+     48        -   0.0%         -  *drift (label_psi)
+     49        -   0.0%         -  *drift (label_psi) -> tightened
+
+ticket.queue@v1 (choice, auto error budget 5%)
+  steady: 67.4% automated, true auto error 100/1888 = 5.3% (95% CI 4.3%-6.4%), not distinguishable from the 5% budget
+  drift from day 36: detected at the end of day 39 (4 day(s) of drifted traffic), auto tier suspended at the end of day 39
+  drift, until the action: true auto error 47/433 = 10.9% (95% CI 8.1%-14.2%)
+  drift, after the action: nothing automated
+
+  phase       days decisions   auto verify  human hard+novel ECE raw ECE cal  true auto error
+  history    1-21       4200   0.0%   0.0% 100.0%      26.6%   0.094       -  -
+  steady    22-35       2800  67.4%  32.6%   0.0%      26.9%   0.102   0.016  100/1888 = 5.3% (95% CI 4.3%-6.4%)
+  drift     36-49       2800  15.5%  84.5%   0.0%      50.8%   0.175   0.075  47/433 = 10.9% (95% CI 8.1%-14.2%)
+  [...]
+```
+
+The full report is in [docs/reports/simulation-seed-7.md](docs/reports/simulation-seed-7.md).
+What it shows:
+
+- **Steady state works.** Refunds: 94% automated with a true error of 4.9% against a 10%
+  budget. Tickets: 67% automated at 5.3% (95% interval 4.3%-6.4%) against 5%: the
+  thresholds are selected so the error rate is within budget with 95% confidence on the
+  labels they were selected on, and on fresh traffic the realised rate sits at the budget.
+  The report says "not distinguishable" rather than calling a pass or a fail on noise.
+- **Calibration matters.** Raw ECE 0.045 and 0.102 drop to 0.007 and 0.016 after
+  calibration in the steady phase.
+- **Drift is caught, but not instantly.** Tickets: the auto tier's own error check and
+  the ECE signal fired after 4 days and suspended the auto tier. Refunds: only the
+  outcome-mix PSI fired, after 7 days; meanwhile the true auto error was 11.5% against a
+  10% budget. The labeled sample above the threshold (5% verify sampling plus delayed
+  outcomes) was too small for the error check to prove a 1.5-point overshoot. The levers
+  are in the routing file: a higher `verify_sample_rate` buys faster detection with
+  reviewer time.
+- **Suspension, not guesswork.** Once drift is confirmed and the window's labels cannot
+  support any threshold, the auto tier is suspended rather than tuned on too little data;
+  decisions go to verify and human until enough new labels exist.
+
+Options: `--dataset/-d` (repeatable), `--per-day`, `--history-days`, `--steady-days`,
+`--drift-days`, `--seed`, `--overconfidence`, `--reviewer-accuracy`, `--outcome-rate`,
+`--outcome-delay-days`, `--refit-every`, `--routing` (defaults to the example policies),
+`--database-url` (must hold no decisions for the simulated questions; afterwards `dgate
+serve` against it shows the whole history), `--markdown` and `--json`.
+`dgate simulate export refund -n 1000 [--drifted]` prints items as JSON lines (input,
+truth, segment) for use elsewhere.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -1062,7 +1173,8 @@ selection and a conformal fit over HTTP and the CLI, `dgate fake-gate`, `dgate r
 check`, and routing: the first decision goes to a human because nothing is calibrated, and
 a refresh over HTTP stores a current rule for every question, the review queue round trip,
 and drift checks over HTTP and the CLI (too little data, so every signal is
-`insufficient` and routing is untouched). The Kafka
+`insufficient` and routing is untouched). A short simulation runs against its own
+PostgreSQL database and its JSON report is checked. The Kafka
 source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 
 ## License

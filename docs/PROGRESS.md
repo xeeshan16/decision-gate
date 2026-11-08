@@ -612,3 +612,92 @@ API and CLI, including that `/v1/decide` still answers when the candidate fails.
 **Next (day 11):** simulator: synthetic ticket-triage and refund-eligibility datasets with
 known ground truth and injected miscalibration and drift; `dgate simulate` produces real
 reports.
+
+## Day 11 (2026-11-08): simulator
+
+**Shipped:** `dgate simulate run`, which runs the whole gate on synthetic traffic whose
+ground truth is known for every decision, and reports the auto tier's *true* error rate
+before and after drift. Nothing is re-implemented: decisions go through the real
+`DecisionService` and router, reviews through the queue, labels through outcome recording,
+and the refit job, routing refresh and drift monitor run nightly against a real database
+on a simulated clock.
+
+- `decision_gate.simulator.datasets`: refund requests judged by a written returns policy
+  and support tickets routed by their subject, each item tagged `easy`, `hard` (policy
+  boundary, ambiguous wording) or `novel`. Each has a drifted population: holiday order
+  ages plus a new marketplace line for refunds; a release that floods the technical queue
+  with tickets about a new feature.
+- `SimulatedModel`: a `DecisionBackend` that answers each segment with its own skill floor
+  and overconfidence (one `FakeBackend` per segment, truth from the dataset). Hard and novel
+  items are less accurate but just as confident, so what a score means depends on the mix.
+- `decision_gate.simulator.engine`: history (no calibrator, so every decision goes to a
+  person whose answer is the label), then refit and first routing rule, steady days, drift
+  days. Reviewers resolve within SLA (configurable accuracy); a share of auto decisions get
+  their true outcome a few days later; refit and refresh every N days, then the drift check.
+- `decision_gate.simulator.report`: per phase tiers, segment mix, raw and calibrated ECE
+  and the true auto error with a Clopper-Pearson interval; detection day, action and error
+  before and after; events and a daily table. Text, Markdown and JSON.
+- `dgate simulate export` prints items as JSON lines.
+- To run on a simulated clock, `DecisionService` and `OutcomeService` take a `clock`, the
+  routing refresher stamps rules with its clock, and a tightened rule is stamped with the
+  check time. `create_app(clock=...)` now passes its clock to all of them, so decisions and
+  outcomes are stamped consistently with reviews and drift checks. `DecisionService` also
+  takes a `new_id` factory: decision ids drive verify sampling, and the simulator derives
+  them from the seed so the same seed gives the same run. `make_engine(...,
+  single_connection=True)` keeps one SQLite connection with WAL for long sequential jobs.
+- CI runs a short simulation against its own PostgreSQL database and checks the JSON.
+
+**Real run (default settings, seed 7, in the README and
+[docs/reports/simulation-seed-7.md](reports/simulation-seed-7.md)):** 200 decisions per
+question per day, 21 + 14 + 14 days.
+
+- Refunds: 94.4% automated in the steady phase with a true error of 4.9% (10% budget).
+  Drift began on day 36; only the outcome-mix PSI fired, at the end of day 42, and the
+  auto tier was suspended. Until then the true auto error was 11.5% (95% CI 9.8%-13.3%).
+- Tickets: 67.4% automated at 5.3% (4.3%-6.4%) against a 5% budget. Drift was caught at
+  the end of day 39 by the auto-error check and the ECE signal, and the tier suspended; true
+  auto error until then 10.9%.
+- Raw ECE 0.045 / 0.102 fell to 0.007 / 0.016 after calibration (steady phase).
+
+**What the simulator taught me (worth more than the numbers):**
+
+- The auto-error check has little power against a small overshoot. With 5% verify sampling
+  and 10% delayed outcomes, a 1.5-point overshoot on refunds was never proven; the label-mix
+  PSI caught the drift instead, a week in. The trade-off (verify rate against detection
+  speed) is now measurable instead of guessed.
+- The ticket steady-state error sits on the budget rather than comfortably under it. The
+  threshold is chosen so the bound holds on the labels it was selected on (fixed-sequence
+  testing over all labeled decisions); on fresh traffic the realised rate came out at the
+  budget. The report says "not distinguishable" instead of calling a pass or fail on
+  noise. Selecting on a held-out split by default would give more margin at the cost of
+  coverage; worth measuring with the simulator.
+- Order of nightly jobs matters. A refresh that installs a *new* calibrator during drift
+  can reopen a suspended auto tier, because a threshold under a new calibrator is not
+  comparable with the old floor (`_respect_drift` deliberately skips that case). Running
+  the drift check after the refit and refresh, as the simulator does, re-selects the
+  threshold on the drift window's labels at once (day 49 of the refund run: refresh reopened at 0.7652, the check re-tightened to 0.7668 on
+  the window's labels). A scheduler that runs them in the other order leaves a gap of one
+  cycle. Documented here; the Compose stack's worker (day 13) will run them in the safe order.
+- The plan's "deliberately injected miscalibration" is per segment rather than a single
+  knob: a global overconfidence is removed by any calibrator, so it would not show drift.
+
+**Honest gaps:**
+
+- Throughput is about 9 ms per decision on average on SQLite through the ORM (19,600
+  decisions in about three minutes here), so the default run takes a few minutes. Fine for a report; not a load test.
+- Reviewers answer instantly and never abandon a claim; lease expiry and backlog under
+  load are tested in the review-queue tests, not simulated.
+- Only predicate and choice datasets; the score question has no simulated dataset yet.
+- Shadow mode is not part of the simulation.
+
+**Tests:** 734 passing locally on Python 3.13 against SQLite and a local PostgreSQL 16
+server (50 new), 100% line and branch coverage. New tests cover the policy rules and drifted
+populations of both datasets, segment-dependent skill and confidence of the model,
+configuration validation, an end-to-end run (history all human, refits, refreshes, nightly
+checks, determinism by seed), simulation into a kept SQLite and PostgreSQL database (and
+refusal to mix with existing decisions), unreliable reviewers and delayed outcomes, report
+findings (false alarms, detection, action, suspension), verdict wording, the CLI and a
+clock test for decisions and outcomes over the API.
+
+**Next (day 12):** observability and resilience: Prometheus metrics, OpenTelemetry, backend
+timeouts and a circuit breaker that falls back to the human tier, plus rate limits.
