@@ -331,3 +331,22 @@ def test_concurrent_duplicate_outcomes_store_one_row(
     created = run(scenario())
     assert created.count(True) == 1
     assert created.count(False) == 4
+
+
+def test_the_api_stamps_decisions_and_outcomes_with_its_clock(
+    sqlite_url: str, example_catalog: QuestionCatalog
+) -> None:
+    moment = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    app = create_app(
+        Settings(database_url=sqlite_url), catalog=example_catalog, clock=lambda: moment
+    )
+    with TestClient(app) as client:
+        decision = client.post(
+            "/v1/decide", json={"question": "refund.eligible", "input": {"order": 1}}
+        ).json()
+        assert decision["created_at"].startswith("2026-03-01T12:00:00")
+        outcome = client.post(
+            "/v1/outcomes",
+            json={"decision_id": decision["id"], "outcome": True, "source": "crm"},
+        ).json()
+        assert outcome["observed_at"].startswith("2026-03-01T12:00:00")

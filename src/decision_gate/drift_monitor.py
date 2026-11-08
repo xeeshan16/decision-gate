@@ -295,6 +295,7 @@ class DriftMonitor:
                 "drift": {"check_id": str(check.id), "replaced_rule_id": str(current.id)},
             },
             drift_check_id=check.id,
+            created_at=check.checked_at,
         )
         check.previous_rule_id = active.id if active else None
         check.rule_id = rule.id

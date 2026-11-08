@@ -407,7 +407,7 @@ def create_app(
     sessions = make_sessionmaker(engine)
     repository = DecisionRepository(sessions)
     outcome_repository = OutcomeRepository(sessions)
-    outcome_service = OutcomeService(catalog, repository, outcome_repository)
+    outcome_service = OutcomeService(catalog, repository, outcome_repository, clock=clock)
     calibrator_repository = CalibratorRepository(sessions)
     refit_job = RefitJob(outcome_repository, calibrator_repository)
     rule_repository = RoutingRuleRepository(sessions)
@@ -439,6 +439,7 @@ def create_app(
         router=router,
         review_sla=settings.review_sla,
         shadow=shadow,
+        clock=clock,
     )
     review_service = ReviewService(
         catalog, ReviewRepository(sessions), settings.review_sla, clock=clock
@@ -746,7 +747,12 @@ def create_app(
             catalog,
             router,
             RoutingRefresher(
-                routing, analyzer, calibrator_repository, rule_repository, drift_repository
+                routing,
+                analyzer,
+                calibrator_repository,
+                rule_repository,
+                drift_repository,
+                clock=clock,
             ),
             rule_repository,
         )

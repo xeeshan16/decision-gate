@@ -78,6 +78,7 @@ DRIFT = {"window_hours": 1.5, "reference_hours": 2.0, "min_decisions": 200, "min
 REFERENCE_N = 3000
 CURRENT_START = 7200  # seconds after BASE: two hours later
 CHECK_AT = BASE + timedelta(hours=3)
+SELECTED_AT = BASE + timedelta(seconds=REFERENCE_N)
 
 
 def config(**drift: Any) -> RoutingConfig:
@@ -179,7 +180,10 @@ async def _with_monitor(database_url: str, routing: RoutingConfig, alerter: Any,
             analyzer=analyzer,
             alerter=alerter,
         )
-        refresher = RoutingRefresher(routing, analyzer, calibrators, rules, checks)
+        # Rules are selected right after the reference traffic, as they would be live.
+        refresher = RoutingRefresher(
+            routing, analyzer, calibrators, rules, checks, clock=lambda: SELECTED_AT
+        )
         router = Router(routing, rules, calibrators, cache_ttl_s=0)
         return await work(monitor, refresher, router, rules, checks)
     finally:
@@ -494,8 +498,8 @@ class TestMonitor:
         assert record.summary["current"]["decisions"] == 3000
         assert record.summary["current"]["labeled"] == 3000
         assert record.summary["rule_current"] is True
-        # The reference ends where the current window starts (the rule is newer).
-        assert record.reference_end == record.window_start
+        # The reference ends where the rule was selected, before the current window starts.
+        assert record.reference_end == SELECTED_AT < record.window_start
 
     def test_broken_model_tightens_routing_and_alerts(
         self, database_url: str, example_catalog: QuestionCatalog

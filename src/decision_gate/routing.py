@@ -52,6 +52,7 @@ from decision_gate.db.repository import (
 )
 from decision_gate.drift import DriftConfig, DriftConfigError, parse_drift
 from decision_gate.questions import Answer, ChoiceQuestion, QuestionCatalog, ScoreQuestion
+from decision_gate.reviews import Clock, as_utc, utc_now
 from decision_gate.selection import AnyQuestion, GateAnalyzer, SelectionError
 
 Tier = Literal["auto", "verify", "human"]
@@ -228,12 +229,15 @@ class RoutingRefresher:
         calibrators: CalibratorRepository,
         rules: RoutingRuleRepository,
         drift_checks: DriftCheckRepository | None = None,
+        *,
+        clock: Clock = utc_now,
     ) -> None:
         self._config = config
         self._analyzer = analyzer
         self._calibrators = calibrators
         self._rules = rules
         self._drift_checks = drift_checks
+        self._clock = clock
 
     async def active_calibrator_id(self, question: AnyQuestion) -> uuid.UUID | None:
         record = await self._calibrators.active(question.id, question.version)
@@ -258,6 +262,7 @@ class RoutingRefresher:
             labeled=0,
             eligible=0,
             evaluation={},
+            created_at=as_utc(self._clock()),
         )
         active = await self._calibrators.active(question.id, question.version)
         if active is None and policy.require_calibrator:

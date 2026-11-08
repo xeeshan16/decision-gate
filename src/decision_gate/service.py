@@ -15,7 +15,7 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,7 +23,7 @@ from decision_gate.backends.base import AnyQuestion, BackendError, DecisionBacke
 from decision_gate.db.models import DecisionRecord, OutcomeRecord
 from decision_gate.db.repository import DecisionRepository, OutcomeRepository
 from decision_gate.questions import Answer, QuestionCatalog
-from decision_gate.reviews import ReviewSla
+from decision_gate.reviews import Clock, ReviewSla, utc_now
 from decision_gate.routing import Router
 from decision_gate.shadow_runner import ShadowRunner
 
@@ -54,6 +54,8 @@ class DecisionService:
         router: Router | None = None,
         review_sla: ReviewSla | None = None,
         shadow: ShadowRunner | None = None,
+        clock: Clock = utc_now,
+        new_id: Callable[[], uuid.UUID] = uuid.uuid4,
     ) -> None:
         self._backend = backend
         self._repository = repository
@@ -62,6 +64,8 @@ class DecisionService:
         self._router = router
         self._review_sla = review_sla
         self._shadow = shadow
+        self._clock = clock
+        self._new_id = new_id
 
     async def decide(
         self,
@@ -88,7 +92,7 @@ class DecisionService:
             ) from exc
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        decision_id = uuid.uuid4()
+        decision_id = self._new_id()
         record = DecisionRecord(
             id=decision_id,
             idempotency_key=idempotency_key,
@@ -102,7 +106,7 @@ class DecisionService:
             backend=raw.backend,
             model_version=raw.model_version,
             latency_ms=latency_ms,
-            created_at=datetime.now(UTC),
+            created_at=_utc(self._clock()),
         )
         if self._router is not None:
             route = await self._router.route(
@@ -167,10 +171,13 @@ class OutcomeService:
         catalog: QuestionCatalog,
         decisions: DecisionRepository,
         outcomes: OutcomeRepository,
+        *,
+        clock: Clock = utc_now,
     ) -> None:
         self._catalog = catalog
         self._decisions = decisions
         self._outcomes = outcomes
+        self._clock = clock
 
     async def record(
         self,
@@ -202,7 +209,7 @@ class OutcomeService:
                 outcome=value,
                 correct=question.is_correct(decision.answer, value),
                 source=source,
-                observed_at=_utc(observed_at) if observed_at else datetime.now(UTC),
+                observed_at=_utc(observed_at or self._clock()),
             )
             existing, created = await self._outcomes.add(record)
             if created:
