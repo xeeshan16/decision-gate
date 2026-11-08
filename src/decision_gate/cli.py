@@ -68,6 +68,11 @@ shadow_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(shadow_app, name="shadow")
+simulate_app = typer.Typer(
+    help="Simulate: run the real gate on synthetic traffic with known truth and drift.",
+    no_args_is_help=True,
+)
+app.add_typer(simulate_app, name="simulate")
 
 CatalogPath = Annotated[
     Path, typer.Option("--questions", "-q", help="Question catalog (YAML or JSON).")
@@ -1766,3 +1771,126 @@ def shadow_compare(
     codes = {"promote": 0, "keep": 3, "insufficient": 4}
     if codes[result.verdict]:
         raise typer.Exit(code=codes[result.verdict])
+
+
+@simulate_app.command("run")
+def simulate_run(
+    dataset: Annotated[
+        list[str] | None,
+        typer.Option("--dataset", "-d", help="refund, ticket (repeatable). Default: both."),
+    ] = None,
+    per_day: Annotated[
+        int, typer.Option("--per-day", "-n", min=1, help="Decisions per day per question.")
+    ] = 200,
+    history_days: Annotated[
+        int, typer.Option(min=1, help="Days before the first calibrator: all human.")
+    ] = 21,
+    steady_days: Annotated[int, typer.Option(min=0, help="Routed days before drift.")] = 14,
+    drift_days: Annotated[int, typer.Option(min=0, help="Days of drifted traffic.")] = 14,
+    seed: Annotated[int, typer.Option(help="Same seed, same run.")] = 7,
+    overconfidence: Annotated[
+        float, typer.Option(min=0.01, help="Model overconfidence on easy items (1 = calibrated).")
+    ] = 2.0,
+    reviewer_accuracy: Annotated[float, typer.Option(min=0.0, max=1.0)] = 1.0,
+    outcome_rate: Annotated[
+        float,
+        typer.Option(min=0.0, max=1.0, help="Share of auto decisions whose truth arrives later."),
+    ] = 0.1,
+    outcome_delay_days: Annotated[float, typer.Option(min=0.0)] = 3.0,
+    refit_every: Annotated[
+        int, typer.Option(min=0, help="Refit and refresh every N days after history (0: once).")
+    ] = 7,
+    routing: Annotated[
+        Path | None,
+        typer.Option("--routing", "-r", help="Routing policies. Default: built-in examples."),
+    ] = None,
+    database_url: Annotated[
+        str | None,
+        typer.Option(
+            "--database-url",
+            help="Simulate into this (empty) database and keep it. Default: a temporary "
+            "SQLite file.",
+        ),
+    ] = None,
+    markdown: Annotated[
+        Path | None, typer.Option("--markdown", help="Also write a Markdown report here.")
+    ] = None,
+    json_out: Annotated[
+        Path | None, typer.Option("--json", help="Also write the full report as JSON here.")
+    ] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", help="No progress on stderr.")] = False,
+) -> None:
+    """Run decision-gate end to end on synthetic traffic and report what really happened.
+
+    Decisions go through the real service, router, review queue, refit job, routing
+    refresh and drift monitor on a simulated clock. Because the simulation knows the true
+    answer of every decision, the report shows the auto tier's real error rate, before and
+    after drift.
+    """
+    from decision_gate.simulator.engine import SimulationConfig, simulate
+    from decision_gate.simulator.report import analyze, render_markdown, render_text
+
+    try:
+        config = SimulationConfig(
+            datasets=tuple(dataset) if dataset else ("refund", "ticket"),
+            seed=seed,
+            per_day=per_day,
+            history_days=history_days,
+            steady_days=steady_days,
+            drift_days=drift_days,
+            overconfidence=overconfidence,
+            reviewer_accuracy=reviewer_accuracy,
+            outcome_rate=outcome_rate,
+            outcome_delay_days=outcome_delay_days,
+            refit_every_days=refit_every,
+        )
+        from decision_gate.simulator.datasets import make_dataset
+
+        for name in config.datasets:
+            make_dataset(name)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    policies = _routing_config(routing) if routing is not None else None
+
+    def progress(day: int, total: int) -> None:
+        if not quiet:
+            typer.echo(f"\rsimulated day {day}/{total}", err=True, nl=day == total)
+
+    try:
+        result = asyncio.run(
+            simulate(config, policies, database_url=database_url, progress=progress)
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    report = analyze(result)
+    typer.echo(render_text(report), nl=False)
+    if markdown is not None:
+        markdown.write_text(render_markdown(report), encoding="utf-8")
+    if json_out is not None:
+        json_out.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+@simulate_app.command("export")
+def simulate_export(
+    dataset: Annotated[str, typer.Argument(help="refund or ticket.")],
+    count: Annotated[int, typer.Option("--count", "-n", min=1)] = 1000,
+    seed: Annotated[int, typer.Option()] = 7,
+    drifted: Annotated[bool, typer.Option("--drifted", help="The drifted population.")] = False,
+) -> None:
+    """Print synthetic items as JSON lines: input, true answer and segment."""
+    from decision_gate.simulator.engine import export_items
+
+    try:
+        items = export_items(dataset, seed=seed, count=count, drifted=drifted)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    for item in items:
+        typer.echo(
+            json.dumps(
+                {"input": item.data, "truth": item.truth, "segment": item.segment},
+                separators=(",", ":"),
+            )
+        )

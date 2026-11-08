@@ -72,6 +72,20 @@ jobs:
           uv run dgate fake-gate -q examples/questions.yaml -n 2000 --target-precision 0.9
           uv run dgate routing check examples/routing.yaml -q examples/questions.yaml
 
+      - name: Simulate end to end against PostgreSQL
+        env:
+          PGPASSWORD: dgate
+        run: |
+          psql -h localhost -U dgate -d dgate -c 'CREATE DATABASE dgate_sim'
+          uv run dgate simulate run -n 100 --history-days 4 --steady-days 3 --drift-days 3 \
+            --refit-every 3 --quiet --json sim.json \
+            --database-url postgresql+asyncpg://dgate:dgate@localhost:5432/dgate_sim
+          # History goes to people; once a calibrator and a rule exist, some decisions
+          # are automated.
+          jq -e '[.questions[].phases.history.tiers.human] == [1, 1]' sim.json
+          jq -e '[.questions[].phases | .steady.tiers.auto, .drift.tiers.auto] | max > 0' sim.json
+          uv run dgate simulate export refund -n 3 | jq -e -s 'length == 3'
+
       - name: Smoke test the API against PostgreSQL
         env:
           DGATE_DATABASE_URL: ${{ env.DGATE_TEST_DATABASE_URL }}
