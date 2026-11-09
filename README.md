@@ -50,7 +50,8 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Drift monitoring: score PSI, outcome-mix PSI, windowed ECE with a bootstrap interval and the auto tier's observed error rate; automatic threshold tightening or suspension that a refresh will not undo while drift lasts; signed webhook alerts | ✅ day 9 |
 | Shadow mode: a candidate backend answers live traffic in the background (or replays stored decisions); both are calibrated identically and compared on the same labeled decisions with McNemar's exact test and auto-tier coverage under the routing policy, for a `promote` / `keep` / `insufficient` verdict | ✅ day 10 |
 | Simulator: synthetic refund and ticket traffic with known truth, segment-dependent miscalibration and injected drift, run through the real service, review queue, refit, routing refresh and drift monitor on a simulated clock; reports the auto tier's true error rate before and after drift (text, Markdown, JSON) | ✅ day 11 |
-| Observability, resilience, Docker Compose | planned (days 12-13) |
+| Observability and resilience: Prometheus `/metrics`, OpenTelemetry traces (optional OTLP export), a circuit breaker on the backend that answers `503` with `fallback_tier: human`, and per-caller rate limits on `/v1/decide` | ✅ day 12 |
+| Docker Compose stack and end-to-end test | planned (day 13) |
 
 ## Architecture
 
@@ -1045,14 +1046,87 @@ serve` against it shows the whole history), `--markdown` and `--json`.
 `dgate simulate export refund -n 1000 [--drifted]` prints items as JSON lines (input,
 truth, segment) for use elsewhere.
 
+### Observability and resilience
+
+**Metrics.** `GET /metrics` serves Prometheus metrics for the process
+(`DGATE_METRICS_ENABLED=false` turns it off):
+
+| Metric | Labels | What it measures |
+| --- | --- | --- |
+| `dgate_http_requests_total`, `dgate_http_request_duration_seconds` | `method`, `route`, `status` | Every request, by route *template* (`/v1/decisions/{decision_id}`); unknown paths are `unmatched` |
+| `dgate_decisions_total` | `question`, `tier`, `replay` | Decisions per tier; idempotent replays are counted separately |
+| `dgate_backend_calls_total` | `backend`, `result` | `ok`, `error`, `timeout`, `cancelled`, or `rejected` by the circuit breaker |
+| `dgate_backend_latency_seconds` | `backend` | Duration of the backend calls that were made |
+| `dgate_circuit_state`, `dgate_circuit_transitions_total` | `backend`, `to` | `0` closed, `1` half-open, `2` open; and every change |
+| `dgate_rate_limited_total` | `route` | Requests answered `429` |
+| `dgate_outcomes_recorded_total` | `source`, `created` | Outcomes over HTTP; `created="false"` for duplicates |
+| `dgate_build_info` | `version` | |
+
+Labels stay low-cardinality: question ids come from the catalog and routes are templates,
+never ids. Real output after one decision and its replay (from the CI smoke test's steps):
+
+```text
+dgate_build_info{version="0.1.0"} 1.0
+dgate_http_requests_total{method="POST",route="/v1/decide",status="201"} 1.0
+dgate_http_requests_total{method="POST",route="/v1/decide",status="200"} 1.0
+dgate_decisions_total{question="ticket.queue",replay="false",tier="human"} 1.0
+dgate_decisions_total{question="ticket.queue",replay="true",tier="human"} 1.0
+dgate_backend_calls_total{backend="fake",result="ok"} 1.0
+dgate_circuit_state{backend="fake"} 0.0
+```
+
+**Traces.** Each request is a server span that continues the caller's W3C `traceparent`,
+with `dgate.decide` inside it and `dgate.backend.decide`, `dgate.route` and `dgate.store`
+inside that (question, tier, decision id and backend as attributes). The service depends
+only on the OpenTelemetry API, which does nothing until a provider is installed. Install
+the `otel` extra (`uv sync --extra otel` or `pip install 'decision-gate[otel]'`) and set `DGATE_OTEL_ENABLED=true` to export over OTLP/HTTP; the endpoint
+and headers come from the standard `OTEL_EXPORTER_OTLP_*` variables.
+
+**Circuit breaker.** After `DGATE_CIRCUIT_FAILURE_THRESHOLD` consecutive backend failures
+(errors, invalid answers or timeouts; default 5), calls are rejected at once for
+`DGATE_CIRCUIT_RESET_S` seconds (default 30) instead of each waiting out the timeout. Then
+one probe call is let through: success closes the circuit, failure opens it for another
+period. Real output with the `http` backend pointed at a port where nothing listens and a
+threshold of 3:
+
+```text
+HTTP/1.1 502 Bad Gateway
+{"detail":"http: request failed: ConnectError('All connection attempts failed')","fallback_tier":"human"}
+HTTP/1.1 502 Bad Gateway
+{"detail":"http: request failed: ConnectError('All connection attempts failed')","fallback_tier":"human"}
+HTTP/1.1 502 Bad Gateway
+{"detail":"http: request failed: ConnectError('All connection attempts failed')","fallback_tier":"human"}
+HTTP/1.1 503 Service Unavailable
+retry-after: 30
+{"detail":"http: circuit open after 3 consecutive failures; retry in 30.0s","fallback_tier":"human"}
+```
+
+**Falling back to a human.** When no answer can be had from the backend (`502`, `503`,
+`504`), the body says `"fallback_tier": "human"`, so a caller needs one rule: anything but
+a decision means the case goes to a person. The gate does not store a decision in that case.
+A row with no model answer and no confidence would have nothing to calibrate and would
+have to be filtered out of every calibration, threshold and drift query. Idempotent replays of
+stored decisions keep working while the circuit is open, because they never reach the
+backend. `/readyz` reports the circuit state but stays ready while it is open: taking every
+replica out of the load balancer because the backend is down would also stop replays,
+outcomes and the review queue.
+
+**Rate limits.** Set `DGATE_RATE_LIMIT_PER_S` (and `DGATE_RATE_LIMIT_BURST`, default 20)
+to limit `POST /v1/decide` per caller with a token bucket; excess requests get `429` with
+`Retry-After`. The caller is the client address, or the header named by
+`DGATE_RATE_LIMIT_KEY_HEADER` (e.g. `X-Client-Id`) when a trusted gateway sets it. Limits
+and the breaker are per replica, in memory: with N replicas the overall limit is N times
+the setting, and a shared limit belongs in the gateway.
+
 ### Endpoints
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness |
-| `GET /readyz` | Readiness, including a database check (`503` when it is unreachable) |
+| `GET /readyz` | Readiness, including a database check (`503` when it is unreachable) and the circuit state |
+| `GET /metrics` | Prometheus metrics |
 | `GET /v1/questions`, `GET /v1/questions/{id}` | Question catalog |
-| `POST /v1/decide` | Ask the backend, store and return the decision. `404` unknown question, `409` idempotency key reused for a different request, `502` backend error or invalid answer, `504` backend timeout |
+| `POST /v1/decide` | Ask the backend, store and return the decision. `404` unknown question, `409` idempotency key reused for a different request, `429` rate limited, `502` backend error or invalid answer, `503` circuit open, `504` backend timeout; the three backend failures carry `"fallback_tier": "human"` |
 | `GET /v1/decisions/{id}` | A stored decision, with its outcome once known |
 | `POST /v1/outcomes` | Record the ground truth for a decision. `201` created, `200` same outcome already recorded, `404` unknown decision, `409` a different outcome was recorded, `422` not a valid answer |
 | `POST /v1/outcomes/batch` | Up to 1,000 outcomes with a per-item status |
@@ -1129,6 +1203,15 @@ never a silently stored decision.
 | `DGATE_KAFKA_OUTCOMES_TOPIC` | `dgate.outcomes` | Topic with outcome events |
 | `DGATE_KAFKA_GROUP_ID` | `decision-gate-outcomes` | Consumer group |
 | `DGATE_KAFKA_DEAD_LETTER_TOPIC` | `dgate.outcomes.dlq` | Where rejected events go; empty disables it |
+| `DGATE_CIRCUIT_BREAKER_ENABLED` | `true` | Stop calling a backend that keeps failing |
+| `DGATE_CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures (errors or timeouts) that open the circuit |
+| `DGATE_CIRCUIT_RESET_S` | `30` | How long it stays open before one probe call |
+| `DGATE_RATE_LIMIT_PER_S` | unset | Average `POST /v1/decide` requests per second per caller; unset means no limit |
+| `DGATE_RATE_LIMIT_BURST` | `20` | Largest burst per caller |
+| `DGATE_RATE_LIMIT_KEY_HEADER` | unset | Header that identifies the caller (set by a trusted gateway); unset means the client address |
+| `DGATE_METRICS_ENABLED` | `true` | Serve `/metrics` |
+| `DGATE_OTEL_ENABLED` | `false` | Export traces over OTLP/HTTP (needs the `otel` extra) |
+| `DGATE_OTEL_SERVICE_NAME` | `decision-gate` | `service.name` on exported spans |
 | `DGATE_LOG_LEVEL` | `info` | `debug`, `info`, `warning` or `error` |
 
 ## Question catalog
@@ -1173,7 +1256,7 @@ selection and a conformal fit over HTTP and the CLI, `dgate fake-gate`, `dgate r
 check`, and routing: the first decision goes to a human because nothing is calibrated, and
 a refresh over HTTP stores a current rule for every question, the review queue round trip,
 and drift checks over HTTP and the CLI (too little data, so every signal is
-`insufficient` and routing is untouched). A short simulation runs against its own
+`insufficient` and routing is untouched), plus `/metrics` counting a decision and its replay. A short simulation runs against its own
 PostgreSQL database and its JSON report is checked. The Kafka
 source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
 

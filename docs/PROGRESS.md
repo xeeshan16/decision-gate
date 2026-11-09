@@ -701,3 +701,66 @@ clock test for decisions and outcomes over the API.
 
 **Next (day 12):** observability and resilience: Prometheus metrics, OpenTelemetry, backend
 timeouts and a circuit breaker that falls back to the human tier, plus rate limits.
+
+## Day 12 (2026-11-09): observability and resilience
+
+**Done**
+
+- `GET /metrics` (Prometheus, per-app registry): HTTP requests and latency by route
+  template, decisions by question, tier and replay, backend calls by result (`ok`, `error`,
+  `timeout`, `cancelled`, `rejected`) and latency, circuit state and transitions, rate
+  limited requests, outcomes by source, build info. Labels are bounded: question ids come
+  from the catalog, routes are templates, unknown paths are `unmatched`.
+- OpenTelemetry tracing on the API alone (`opentelemetry-api`, a no-op until a provider
+  exists): a server span per request that continues the caller's `traceparent` (no extra
+  instrumentation package needed), and `dgate.decide` > `dgate.backend.decide`,
+  `dgate.route`, `dgate.store` inside it. The `otel` extra plus `DGATE_OTEL_ENABLED`
+  installs the SDK with an OTLP/HTTP exporter in `dgate serve`, configured by the
+  standard `OTEL_EXPORTER_OTLP_*` variables, and flushes it on shutdown.
+- `resilience.py`: a consecutive-failure circuit breaker with a single half-open probe
+  (errors, invalid answers and timeouts count; cancellations and caller bugs free the
+  probe slot without judging the backend), and a per-key token-bucket rate limiter with
+  LRU-bounded keys. Both take an injected monotonic clock, so the tests step time.
+- `POST /v1/decide`: the backend call goes through the breaker with the existing time
+  limit. An open circuit answers `503` at once with `Retry-After`. `502`, `503` and `504`
+  bodies carry `"fallback_tier": "human"`. Rate limits (`DGATE_RATE_LIMIT_PER_S`, burst,
+  optional key header) answer `429` with `Retry-After`. `/readyz` reports the circuit.
+- CI's API smoke test checks `/metrics` counts a decision and its replay.
+
+**Design decision: the fallback is a signal, not a stored decision.** The plan said the
+breaker "falls back to the human tier". I considered storing a human-tier decision with no
+answer so it would land in the review queue. I didn't, because a decision row without an answer and
+confidence would need a schema change and a filter in every calibration, refit,
+threshold, drift and shadow query, and the review flow records the reviewer's answer as an
+outcome scored against the model's answer, which would not exist. Instead the failure
+response tells the caller to send the case to a person (`fallback_tier: human`). The
+contract stays simple: anything but a decision means human. Idempotent replays keep working while the
+circuit is open because they never reach the backend.
+
+**Why `/readyz` stays ready with the circuit open:** readiness failing would take every
+replica out of the load balancer during a backend outage, which would also stop replays,
+outcomes and the review queue, the parts that still work.
+
+**Real output** (in the README): with the `http` backend pointed at a closed port and a
+threshold of 3, three `502`s, then `503` with `retry-after: 30`; `/metrics` showed
+`result="error"` 3 and `result="rejected"` 1, and `dgate_circuit_state` 2.
+
+**Honest gaps**
+
+- Breaker and limits are per replica and in memory. With N replicas the effective rate
+  limit is N times the setting; a shared limit belongs in the gateway.
+- No retries on the backend call: a retry inside a 10 s time limit mostly doubles load on
+  a struggling backend. The caller can retry with an idempotency key.
+- The shadow candidate has its own time limit and in-flight cap, but no breaker of its own yet.
+- Not load-tested; no latency numbers are claimed.
+
+**Tests:** 30 new (breaker states, single probe, cancellation, reset on success, token
+bucket refill and LRU eviction, metrics and spans through the API, `traceparent`
+continuation, `429`/`503`/`504` bodies and headers, breaker disabled, cancelled backend
+calls). Ruff, mypy (strict) and the full suite pass locally on Python 3.13 against SQLite
+and a local PostgreSQL 16 server: 764 passing, 100% line and branch coverage.
+
+**Next (day 13):** Docker Compose (API, worker running refit, routing refresh and drift
+checks in the safe order, PostgreSQL, optional Kafka and an OTel collector),
+an end-to-end test against the stack, reliability-diagram reports and a statistics
+write-up.
