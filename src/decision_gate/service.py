@@ -6,6 +6,11 @@ Each decision is routed (auto, verify or human) before it is stored, and the tie
 stored with it, so an idempotent replay returns the same tier even if the thresholds
 have changed since. Verify and human decisions are enqueued for review in the same
 transaction.
+
+The backend call goes through an optional circuit breaker, and every step (backend,
+routing, storing) is a tracing span with metrics recorded per call. When no answer can
+be had from the backend, the service raises; it never stores a decision without one,
+because a decision the model did not make has no confidence to calibrate.
 """
 
 from __future__ import annotations
@@ -19,13 +24,15 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from decision_gate.backends.base import AnyQuestion, BackendError, DecisionBackend
+from decision_gate.backends.base import AnyQuestion, BackendError, DecisionBackend, RawDecision
 from decision_gate.db.models import DecisionRecord, OutcomeRecord
 from decision_gate.db.repository import DecisionRepository, OutcomeRepository
 from decision_gate.questions import Answer, QuestionCatalog
+from decision_gate.resilience import CircuitBreaker, CircuitOpenError
 from decision_gate.reviews import Clock, ReviewSla, utc_now
 from decision_gate.routing import Router
 from decision_gate.shadow_runner import ShadowRunner
+from decision_gate.telemetry import BackendResult, Telemetry
 
 MAX_REASON_LENGTH = 500
 
@@ -56,8 +63,12 @@ class DecisionService:
         shadow: ShadowRunner | None = None,
         clock: Clock = utc_now,
         new_id: Callable[[], uuid.UUID] = uuid.uuid4,
+        breaker: CircuitBreaker | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._backend = backend
+        self._breaker = breaker
+        self._telemetry = telemetry or Telemetry()
         self._repository = repository
         self._timeout_s = timeout_s
         self._store_inputs = store_inputs
@@ -75,22 +86,37 @@ class DecisionService:
         idempotency_key: str | None = None,
     ) -> tuple[DecisionRecord, bool]:
         """Return ``(decision, created)``; ``created`` is false for an idempotent replay."""
+        tracer = self._telemetry.tracer
+        with tracer.start_as_current_span(
+            "dgate.decide",
+            attributes={
+                "dgate.question.id": question.id,
+                "dgate.question.version": question.version,
+            },
+        ) as span:
+            record, created = await self._decide(question, data, idempotency_key)
+            span.set_attribute("dgate.decision.id", str(record.id))
+            span.set_attribute("dgate.tier", record.tier or "none")
+            span.set_attribute("dgate.replay", not created)
+            self._telemetry.record_decision(question.id, record.tier, replay=not created)
+            return record, created
+
+    async def _decide(
+        self, question: AnyQuestion, data: Mapping[str, Any], idempotency_key: str | None
+    ) -> tuple[DecisionRecord, bool]:
+        tracer = self._telemetry.tracer
         digest = input_sha256(data)
         if idempotency_key is not None:
             existing = await self._repository.get_by_idempotency_key(idempotency_key)
             if existing is not None:
                 return self._check_replay(existing, question, digest), False
 
-        started = time.perf_counter()
-        try:
-            raw = await asyncio.wait_for(
-                self._backend.decide(question, data), timeout=self._timeout_s
-            )
-        except TimeoutError as exc:
-            raise BackendTimeoutError(
-                f"{self._backend.name}: no answer within {self._timeout_s:g}s"
-            ) from exc
-        latency_ms = (time.perf_counter() - started) * 1000.0
+        with tracer.start_as_current_span(
+            "dgate.backend.decide", attributes={"dgate.backend": self._backend.name}
+        ):
+            started = time.perf_counter()
+            raw = await self._call_backend(question, data)
+            latency_ms = (time.perf_counter() - started) * 1000.0
 
         decision_id = self._new_id()
         record = DecisionRecord(
@@ -109,9 +135,10 @@ class DecisionService:
             created_at=_utc(self._clock()),
         )
         if self._router is not None:
-            route = await self._router.route(
-                question, decision_id, raw.answer, raw.confidence, raw.probabilities
-            )
+            with tracer.start_as_current_span("dgate.route"):
+                route = await self._router.route(
+                    question, decision_id, raw.answer, raw.confidence, raw.probabilities
+                )
             record.tier = route.tier
             record.routing_reason = _clip(route.reason, MAX_REASON_LENGTH)
             record.calibrated_confidence = route.calibrated_confidence
@@ -119,13 +146,47 @@ class DecisionService:
             record.routing_rule_id = route.rule_id
             record.answer_set = route.answer_set
         review = self._review_sla.new_item(record) if self._review_sla else None
-        stored, created = await self._repository.add(record, review)
+        with tracer.start_as_current_span("dgate.store"):
+            stored, created = await self._repository.add(record, review)
         if not created:
             self._check_replay(stored, question, digest)
         elif self._shadow is not None:
             # In the background, after the decision is stored (the shadow row references it).
             self._shadow.submit(question, stored.id, data)
         return stored, created
+
+    async def _call_backend(self, question: AnyQuestion, data: Mapping[str, Any]) -> RawDecision:
+        """One backend call with the time limit, through the breaker, measured."""
+
+        async def attempt() -> RawDecision:
+            try:
+                return await asyncio.wait_for(
+                    self._backend.decide(question, data), timeout=self._timeout_s
+                )
+            except TimeoutError as exc:
+                raise BackendTimeoutError(
+                    f"{self._backend.name}: no answer within {self._timeout_s:g}s"
+                ) from exc
+
+        started = time.perf_counter()
+        result: BackendResult = "error"
+        try:
+            raw = await (self._breaker.call(attempt) if self._breaker else attempt())
+            result = "ok"
+            return raw
+        except CircuitOpenError:
+            result = "rejected"
+            raise
+        except BackendTimeoutError:
+            result = "timeout"
+            raise
+        except asyncio.CancelledError:
+            result = "cancelled"
+            raise
+        finally:
+            self._telemetry.record_backend_call(
+                self._backend.name, result, time.perf_counter() - started
+            )
 
     @staticmethod
     def _check_replay(record: DecisionRecord, question: AnyQuestion, digest: str) -> DecisionRecord:

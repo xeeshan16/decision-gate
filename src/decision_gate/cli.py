@@ -95,9 +95,15 @@ def serve(
 
     from decision_gate.app import create_app
     from decision_gate.config import Settings
+    from decision_gate.telemetry import configure_tracing
 
     settings = Settings()
-    uvicorn.run(create_app(settings), host=host, port=port, log_level=settings.log_level)
+    provider = configure_tracing(settings)
+    try:
+        uvicorn.run(create_app(settings), host=host, port=port, log_level=settings.log_level)
+    finally:
+        if provider is not None:
+            provider.shutdown()  # flush spans still in the batch
 
 
 DatabaseURL = Annotated[

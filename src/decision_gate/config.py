@@ -127,9 +127,42 @@ class Settings(BaseSettings):
         description="Where rejected outcome events go. Empty disables dead-lettering.",
     )
 
+    circuit_breaker_enabled: bool = Field(
+        default=True,
+        description="Stop calling a backend that keeps failing and answer 503 at once.",
+    )
+    circuit_failure_threshold: int = Field(
+        default=5, ge=1, description="Consecutive failures (errors or timeouts) that open it."
+    )
+    circuit_reset_s: float = Field(
+        default=30.0, gt=0, description="How long it stays open before one probe call."
+    )
+
+    rate_limit_per_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Average POST /v1/decide requests per second per caller. Unset: no limit.",
+    )
+    rate_limit_burst: int = Field(default=20, ge=1, description="Largest burst per caller.")
+    rate_limit_key_header: str | None = Field(
+        default=None,
+        description="Header that identifies the caller, e.g. 'X-Client-Id', when a trusted "
+        "gateway sets it. Unset: the client address.",
+    )
+
+    metrics_enabled: bool = Field(default=True, description="Serve Prometheus /metrics.")
+    otel_enabled: bool = Field(
+        default=False,
+        description="Export OpenTelemetry traces over OTLP/HTTP (needs the 'otel' extra; "
+        "the endpoint comes from OTEL_EXPORTER_OTLP_ENDPOINT).",
+    )
+    otel_service_name: str = "decision-gate"
+
     log_level: Literal["debug", "info", "warning", "error"] = "info"
 
-    @field_validator("shadow_backend", "shadow_name", mode="before")
+    @field_validator(
+        "shadow_backend", "shadow_name", "rate_limit_key_header", "rate_limit_per_s", mode="before"
+    )
     @classmethod
     def _blank_is_none(cls, value: object) -> object:
         return None if value == "" else value

@@ -113,6 +113,12 @@ jobs:
             -H 'content-type: application/json' -H 'Idempotency-Key: smoke-1' \
             -d '{"question": "ticket.queue", "input": {"subject": "card declined"}}')
           test "$status" = 200
+          # Prometheus sees the decision and its replay, with the route as a template.
+          metrics=$(curl -sf localhost:8080/metrics)
+          echo "$metrics" | grep -q 'dgate_decisions_total{question="ticket.queue",replay="false",tier="human"} 1.0'
+          echo "$metrics" | grep -q 'dgate_decisions_total{question="ticket.queue",replay="true",tier="human"} 1.0'
+          echo "$metrics" | grep -q 'dgate_http_requests_total{method="POST",route="/v1/decide",status="201"} 1.0'
+          curl -sf localhost:8080/readyz | jq -e '.circuit == "closed"'
           # Record an outcome over HTTP, replay it through the JSON Lines ingester (a
           # duplicate, so --strict passes), and check the stats see exactly one label.
           outcome="{\"decision_id\": \"$id\", \"outcome\": \"billing\"}"

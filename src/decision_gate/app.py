@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, get_args
 
-from fastapi import FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
@@ -49,6 +50,13 @@ from decision_gate.refit import (
     RefitOutcome,
     RefitResult,
 )
+from decision_gate.resilience import (
+    CircuitBreaker,
+    CircuitOpenError,
+    MonotonicClock,
+    RateLimiter,
+    retry_after_header,
+)
 from decision_gate.reviews import Clock, ReviewService, utc_now
 from decision_gate.reviews_api import reviews_router
 from decision_gate.routing import Router, RoutingConfig, RoutingRefresher, Tier, load_routing
@@ -65,6 +73,7 @@ from decision_gate.service import (
 )
 from decision_gate.shadow_api import shadow_router
 from decision_gate.shadow_runner import ShadowRunner
+from decision_gate.telemetry import Telemetry
 
 MAX_OUTCOME_BATCH = 1000
 
@@ -384,6 +393,23 @@ class DecisionOut(BaseModel):
         )
 
 
+def _caller_key(request: Request, header: str | None) -> str:
+    """Who a request counts against for rate limiting."""
+    if header is not None:
+        value = request.headers.get(header)
+        if value:
+            return f"h:{value[:200]}"
+    return f"ip:{request.client.host if request.client else 'unknown'}"
+
+
+def _no_decision(
+    status_code: int, exc: Exception, headers: dict[str, str] | None = None
+) -> JSONResponse:
+    return JSONResponse(
+        {"detail": str(exc), "fallback_tier": "human"}, status_code=status_code, headers=headers
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -394,8 +420,11 @@ def create_app(
     clock: Clock = utc_now,
     alerter: AlertSink | None = None,
     shadow_backend: DecisionBackend | None = None,
+    telemetry: Telemetry | None = None,
+    monotonic: MonotonicClock = time.monotonic,
 ) -> FastAPI:
     settings = settings or Settings()
+    telemetry = telemetry or Telemetry()
     if catalog is None:
         catalog = (
             load_catalog(settings.questions_file) if settings.questions_file else QuestionCatalog()
@@ -431,6 +460,18 @@ def create_app(
             questions=settings.shadow_question_ids,
             max_pending=settings.shadow_max_pending,
         )
+    breaker: CircuitBreaker | None = None
+    if settings.circuit_breaker_enabled:
+        breaker = CircuitBreaker(
+            backend.name,
+            failure_threshold=settings.circuit_failure_threshold,
+            reset_after_s=settings.circuit_reset_s,
+            clock=monotonic,
+            on_state_change=telemetry.circuit_listener(backend.name),
+        )
+    limiter: RateLimiter | None = None
+    if settings.rate_limit_per_s is not None:
+        limiter = RateLimiter(settings.rate_limit_per_s, settings.rate_limit_burst, clock=monotonic)
     service = DecisionService(
         backend,
         repository,
@@ -440,6 +481,8 @@ def create_app(
         review_sla=settings.review_sla,
         shadow=shadow,
         clock=clock,
+        breaker=breaker,
+        telemetry=telemetry,
     )
     review_service = ReviewService(
         catalog, ReviewRepository(sessions), settings.review_sla, clock=clock
@@ -469,6 +512,16 @@ def create_app(
     app.state.outcome_service = outcome_service
     app.state.router = router
     app.state.shadow = shadow
+    app.state.telemetry = telemetry
+    app.state.breaker = breaker
+    app.middleware("http")(telemetry.http_middleware)
+
+    if settings.metrics_enabled:
+
+        @app.get("/metrics", tags=["ops"], include_in_schema=False)
+        async def metrics() -> Response:
+            """Prometheus metrics for this process."""
+            return telemetry.exposition()
 
     @app.get("/healthz", tags=["ops"])
     async def healthz() -> dict[str, str]:
@@ -484,6 +537,7 @@ def create_app(
             "backend": backend.name,
             "questions": len(catalog.questions),
             "database": "ok",
+            "circuit": breaker.state.value if breaker is not None else "disabled",
         }
         try:
             async with engine.connect() as connection:
@@ -509,20 +563,39 @@ def create_app(
         "/v1/decide",
         tags=["decisions"],
         status_code=status.HTTP_201_CREATED,
+        response_model=DecisionOut,
         responses={
             200: {"description": "Idempotent replay of an earlier decision."},
             404: {"description": "Unknown question."},
             409: {"description": "Idempotency key reused for a different request."},
+            429: {"description": "Rate limit exceeded; see Retry-After."},
             502: {"description": "The backend failed or returned an invalid decision."},
+            503: {"description": "Circuit open: the backend is failing; see Retry-After."},
             504: {"description": "The backend timed out."},
         },
     )
     async def decide(
         request: DecideRequest,
+        http_request: Request,
         response: Response,
         idempotency_key: Annotated[str | None, Header(max_length=200)] = None,
-    ) -> DecisionOut:
-        """Ask the backend, record the decision and return it."""
+    ) -> DecisionOut | JSONResponse:
+        """Ask the backend, record the decision and return it.
+
+        When no decision can be had from the backend (502, 503, 504), the body carries
+        ``"fallback_tier": "human"``: nothing was recorded and the caller should send the
+        case to a person. Idempotent replays of stored decisions still succeed while the
+        circuit is open, because they never reach the backend.
+        """
+        if limiter is not None:
+            wait = limiter.acquire(_caller_key(http_request, settings.rate_limit_key_header))
+            if wait > 0:
+                telemetry.rate_limited.labels("/v1/decide").inc()
+                return JSONResponse(
+                    {"detail": "rate limit exceeded", "retry_after_s": round(wait, 3)},
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    headers={"Retry-After": retry_after_header(wait)},
+                )
         try:
             question = catalog.get(request.question, request.version)
         except KeyError as exc:
@@ -532,10 +605,12 @@ def create_app(
             record, created = await service.decide(question, request.input, idempotency_key=key)
         except IdempotencyConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CircuitOpenError as exc:
+            return _no_decision(503, exc, {"Retry-After": retry_after_header(exc.retry_after_s)})
         except BackendTimeoutError as exc:
-            raise HTTPException(status_code=504, detail=str(exc)) from exc
+            return _no_decision(504, exc)
         except BackendError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            return _no_decision(502, exc)
         if not created:
             response.status_code = status.HTTP_200_OK
         return DecisionOut.from_record(record)
@@ -573,6 +648,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except InvalidOutcomeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        telemetry.record_outcome(record.source, created=created)
         if not created:
             response.status_code = status.HTTP_200_OK
         return OutcomeOut.from_record(record)
@@ -602,6 +678,7 @@ def create_app(
             return failed("conflict", exc)
         except InvalidOutcomeError as exc:
             return failed("invalid", exc)
+        telemetry.record_outcome(record.source, created=created)
         return OutcomeBatchItem(
             decision_id=item.decision_id,
             status="created" if created else "duplicate",

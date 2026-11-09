@@ -37,6 +37,7 @@ def test_readyz(client: TestClient) -> None:
         "backend": "fake",
         "questions": 3,
         "database": "ok",
+        "circuit": "closed",
     }
 
 
