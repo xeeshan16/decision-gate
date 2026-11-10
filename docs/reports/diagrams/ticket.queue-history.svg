@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="600" viewBox="0 0 480 600" font-family="Helvetica, Arial, sans-serif" font-size="12" role="img" aria-label="ticket.queue@v1: history phase">
+<rect width="480" height="600" fill="#ffffff"/>
+<text x="64" y="24" font-size="15" font-weight="bold" fill="#1f2328">ticket.queue@v1: history phase</text>
+<text x="64" y="42" fill="#59636e">days 1-21, 4200 decisions, seed 7, true outcomes</text>
+<line x1="64.0" y1="64" x2="64.0" y2="424" stroke="#afb8c1" stroke-width="0.5"/>
+<line x1="64" y1="424.0" x2="424" y2="424.0" stroke="#afb8c1" stroke-width="0.5"/>
+<text x="64.0" y="440" text-anchor="middle" fill="#59636e">0.0</text>
+<text x="56" y="428.0" text-anchor="end" fill="#59636e">0.0</text>
+<line x1="100.0" y1="64" x2="100.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="388.0" x2="424" y2="388.0" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="136.0" y1="64" x2="136.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="352.0" x2="424" y2="352.0" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="136.0" y="440" text-anchor="middle" fill="#59636e">0.2</text>
+<text x="56" y="356.0" text-anchor="end" fill="#59636e">0.2</text>
+<line x1="172.0" y1="64" x2="172.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="316.0" x2="424" y2="316.0" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="208.0" y1="64" x2="208.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="280.0" x2="424" y2="280.0" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="208.0" y="440" text-anchor="middle" fill="#59636e">0.4</text>
+<text x="56" y="284.0" text-anchor="end" fill="#59636e">0.4</text>
+<line x1="244.0" y1="64" x2="244.0" y2="424" stroke="#afb8c1" stroke-width="0.5"/>
+<line x1="64" y1="244.0" x2="424" y2="244.0" stroke="#afb8c1" stroke-width="0.5"/>
+<line x1="280.0" y1="64" x2="280.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="208.0" x2="424" y2="208.0" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="280.0" y="440" text-anchor="middle" fill="#59636e">0.6</text>
+<text x="56" y="212.0" text-anchor="end" fill="#59636e">0.6</text>
+<line x1="316.0" y1="64" x2="316.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="172.0" x2="424" y2="172.0" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="352.0" y1="64" x2="352.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="136.0" x2="424" y2="136.0" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="352.0" y="440" text-anchor="middle" fill="#59636e">0.8</text>
+<text x="56" y="140.0" text-anchor="end" fill="#59636e">0.8</text>
+<line x1="388.0" y1="64" x2="388.0" y2="424" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="64" y1="100.0" x2="424" y2="100.0" stroke="#d0d7de" stroke-width="0.5"/>
+<line x1="424.0" y1="64" x2="424.0" y2="424" stroke="#afb8c1" stroke-width="0.5"/>
+<line x1="64" y1="64.0" x2="424" y2="64.0" stroke="#afb8c1" stroke-width="0.5"/>
+<text x="424.0" y="440" text-anchor="middle" fill="#59636e">1.0</text>
+<text x="56" y="68.0" text-anchor="end" fill="#59636e">1.0</text>
+<rect x="64" y="64" width="360" height="360" fill="none" stroke="#59636e" stroke-width="1"/>
+<line x1="64" y1="424.0" x2="424" y2="64.0" stroke="#8c959f" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="244.0" y="458" text-anchor="middle" fill="#1f2328">mean confidence in bin</text>
+<text transform="translate(18 244.0) rotate(-90)" text-anchor="middle" fill="#1f2328">observed accuracy</text>
+<polyline points="385.5,250.7 422.4,98.7" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="385.5" cy="250.7" r="3.5" fill="#d1495b"/>
+<circle cx="422.4" cy="98.7" r="3.5" fill="#d1495b"/>
+<rect x="74" y="74" width="14" height="4" fill="#d1495b"/>
+<text x="94" y="80" fill="#1f2328">raw confidence  (ECE 0.094, n=4200)</text>
+<text x="64" y="486" fill="#59636e">decisions per bin (raw confidence)</text>
+<rect x="352.5" y="563.5" width="35.0" height="0.5" fill="#8c959f"><title>27 decisions in (0.80, 0.90]</title></rect>
+<rect x="388.5" y="492.0" width="35.0" height="72.0" fill="#8c959f"><title>4173 decisions in (0.90, 1.00]</title></rect>
+<line x1="64" y1="564" x2="424" y2="564" stroke="#59636e" stroke-width="1"/>
+</svg>

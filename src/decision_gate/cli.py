@@ -551,6 +551,96 @@ def calibration_report(
             _print_bins(report)
 
 
+async def _diagram_series(
+    database_url: str, *, question: str | None, n_bins: int, min_count: int
+) -> list[tuple[str, int, list[Any]]]:
+    """Per question version: the raw series and, with an active calibrator, a calibrated one."""
+    from itertools import groupby
+
+    from decision_gate.calibrators import CalibrationError, load_calibrator
+    from decision_gate.db import make_engine, make_sessionmaker
+    from decision_gate.db.repository import CalibratorRepository, OutcomeRepository
+    from decision_gate.refit import calibration_data
+    from decision_gate.reliability import series_from_pairs
+
+    engine = make_engine(database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        rows = await OutcomeRepository(sessions).labeled_rows(question_id=question)
+        calibrators = CalibratorRepository(sessions)
+        out: list[tuple[str, int, list[Any]]] = []
+        ordered = sorted(rows, key=lambda r: (r.question_id, r.question_version))
+        for (qid, version), members in groupby(
+            ordered, key=lambda r: (r.question_id, r.question_version)
+        ):
+            group = list(members)
+            if len(group) < min_count:
+                continue
+            correct = [row.correct for row in group]
+            series = [
+                series_from_pairs(
+                    "raw confidence", [row.confidence for row in group], correct, n_bins=n_bins
+                )
+            ]
+            record = await calibrators.active(qid, version)
+            if record is not None:
+                try:
+                    calibrated = load_calibrator(record.method, record.params).predict(
+                        calibration_data(group)
+                    )
+                except CalibrationError as exc:  # pragma: no cover - stored params are valid
+                    typer.echo(f"warning: {qid}@v{version}: {exc}", err=True)
+                else:
+                    series.append(
+                        series_from_pairs(
+                            f"calibrated (v{record.version} {record.method})",
+                            calibrated,
+                            correct,
+                            n_bins=n_bins,
+                        )
+                    )
+            out.append((qid, version, series))
+        return out
+    finally:
+        await engine.dispose()
+
+
+@calibration_app.command("diagram")
+def calibration_diagram(
+    out: Annotated[Path, typer.Argument(help="Directory to write one SVG per question version.")],
+    question: Annotated[str | None, typer.Option(help="Only this question id.")] = None,
+    bins: Annotated[int, typer.Option(min=2, max=50, help="Number of equal-width bins.")] = 10,
+    min_count: Annotated[int, typer.Option(min=1, help="Skip smaller question versions.")] = 50,
+    url: DatabaseURL = None,
+) -> None:
+    """Draw reliability diagrams (SVG) from labeled decisions: raw vs. active calibrator.
+
+    Note that a calibrator drawn on the labels it was fitted on looks better than it will
+    on new traffic; the refit job's held-out numbers are the honest ones.
+    """
+    from decision_gate.reliability import render_reliability_svg
+
+    groups = asyncio.run(
+        _diagram_series(_database_url(url), question=question, n_bins=bins, min_count=min_count)
+    )
+    if not groups:
+        typer.echo("no question version has enough labeled decisions")
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    for qid, version, series in groups:
+        path = out / f"{qid}@v{version}.svg"
+        path.write_text(
+            render_reliability_svg(
+                f"{qid}@v{version}",
+                series,
+                subtitle=f"{series[0].count} labeled decisions, {bins} bins",
+            ),
+            encoding="utf-8",
+        )
+        eces = ", ".join(f"{s.label} ECE {s.ece:.3f}" for s in series)
+        typer.echo(f"{path}  {eces}")
+
+
 def _as_utc(moment: datetime | None) -> datetime | None:
     if moment is None or moment.tzinfo is not None:
         return moment
@@ -1894,6 +1984,10 @@ def simulate_run(
     json_out: Annotated[
         Path | None, typer.Option("--json", help="Also write the full report as JSON here.")
     ] = None,
+    diagrams: Annotated[
+        Path | None,
+        typer.Option("--diagrams", help="Also write reliability diagrams (SVG) to this directory."),
+    ] = None,
     quiet: Annotated[bool, typer.Option("--quiet", help="No progress on stderr.")] = False,
 ) -> None:
     """Run decision-gate end to end on synthetic traffic and report what really happened.
@@ -1946,6 +2040,12 @@ def simulate_run(
         markdown.write_text(render_markdown(report), encoding="utf-8")
     if json_out is not None:
         json_out.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+    if diagrams is not None:
+        from decision_gate.simulator.report import phase_diagrams
+
+        diagrams.mkdir(parents=True, exist_ok=True)
+        for name, svg in phase_diagrams(result).items():
+            (diagrams / name).write_text(svg, encoding="utf-8")
 
 
 @simulate_app.command("export")

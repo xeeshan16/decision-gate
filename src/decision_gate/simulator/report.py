@@ -394,3 +394,47 @@ __all__ = [
     "render_text",
     "summarize",
 ]
+
+
+def phase_diagrams(result: SimulationResult, *, n_bins: int = 10) -> dict[str, str]:
+    """Reliability diagrams (SVG) per question and phase, keyed by file name.
+
+    Calibrated confidences here come from the calibrator that was active when each
+    decision was made, so unlike a diagram drawn on a calibrator's own training labels,
+    these show how calibration held up on traffic it had not seen.
+    """
+    from decision_gate.reliability import render_reliability_svg, series_from_pairs
+
+    cfg = result.config
+    diagrams: dict[str, str] = {}
+    for run in result.runs.values():
+        for phase in PHASES:
+            traces = [t for t in run.traces if cfg.phase(t.day) == phase]
+            if len(traces) < 50:
+                continue
+            series = [
+                series_from_pairs(
+                    "raw confidence",
+                    [t.confidence for t in traces],
+                    [t.correct for t in traces],
+                    n_bins=n_bins,
+                )
+            ]
+            calibrated = [t for t in traces if t.calibrated is not None]
+            if len(calibrated) >= 50:
+                series.append(
+                    series_from_pairs(
+                        "calibrated (active calibrator)",
+                        [t.calibrated for t in calibrated if t.calibrated is not None],
+                        [t.correct for t in calibrated],
+                        n_bins=n_bins,
+                    )
+                )
+            days = sorted({t.day for t in traces})
+            diagrams[f"{run.question.id}-{phase}.svg"] = render_reliability_svg(
+                f"{run.question.key}: {phase} phase",
+                series,
+                subtitle=f"days {days[0] + 1}-{days[-1] + 1}, {len(traces)} decisions, "
+                f"seed {cfg.seed}, true outcomes",
+            )
+    return diagrams

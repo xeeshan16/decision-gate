@@ -405,9 +405,12 @@ class TestCli:
             [
                 *("simulate", "run", *TINY, "-d", "refund", "-r", str(routing)),
                 *("--markdown", str(md), "--json", str(js), "--refit-every", "0"),
+                *("--diagrams", str(tmp_path / "svg")),
             ],
         )
         assert result.exit_code == 0, result.output
+        # Only the history phase (120 decisions) reaches the 50 a diagram needs.
+        assert [p.name for p in (tmp_path / "svg").iterdir()] == ["refund.eligible-history.svg"]
         assert "refund.eligible@v1" in result.stdout
         assert "ticket.queue" not in result.stdout
         assert md.read_text().startswith("# decision-gate simulation report")
