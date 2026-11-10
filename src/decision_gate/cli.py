@@ -112,6 +112,76 @@ DatabaseURL = Annotated[
 ]
 
 
+@app.command()
+def worker(
+    once: Annotated[bool, typer.Option("--once", help="Run one pass and exit.")] = False,
+    interval: Annotated[
+        float, typer.Option(min=1.0, help="Seconds to wait after one pass before the next.")
+    ] = 900.0,
+    min_count: Annotated[
+        int, typer.Option(min=2, help="Refit only question versions with this many labels.")
+    ] = 100,
+    routing: Annotated[
+        Path | None,
+        typer.Option("--routing", "-r", help="Routing policies. Default: DGATE_ROUTING_FILE."),
+    ] = None,
+    questions: Annotated[
+        Path | None,
+        typer.Option("--questions", "-q", help="Question catalog. Default: DGATE_QUESTIONS_FILE."),
+    ] = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Keep the gate current: refit, refresh routing, then check drift, on a timer.
+
+    Prints one JSON line per pass. With --once, exits with status 3 when a question is
+    drifting and 1 when a step failed, so a cron job or Kubernetes CronJob can flag it.
+    SIGINT/SIGTERM finish the pass in progress, then stop.
+    """
+    import signal
+
+    from decision_gate.config import Settings
+    from decision_gate.db import make_engine
+    from decision_gate.worker import PassReport, build_worker
+
+    config = _routing_config(routing)
+    catalog = _catalog_for_ingest(questions)
+    database_url = _database_url(url)
+
+    def emit(report: PassReport) -> None:
+        typer.echo(json.dumps(report.as_dict(), separators=(",", ":")))
+
+    async def main() -> PassReport | None:
+        engine = make_engine(database_url)
+        try:
+            gate = build_worker(
+                engine,
+                catalog.questions,
+                config,
+                alerter=Settings().drift_alerter(),
+                refit_options={"min_count": min_count},
+            )
+            if once:
+                report = await gate.run_once()
+                emit(report)
+                return report
+            stop = asyncio.Event()  # pragma: no cover - the loop is exercised in unit tests
+            loop = asyncio.get_running_loop()  # pragma: no cover
+            for sig in (signal.SIGINT, signal.SIGTERM):  # pragma: no cover
+                loop.add_signal_handler(sig, stop.set)
+            await gate.run_forever(interval, stop, emit)  # pragma: no cover
+            return None  # pragma: no cover
+        finally:
+            await engine.dispose()
+
+    report = asyncio.run(main())
+    if report is None:  # pragma: no cover - the loop only ends on a signal
+        return
+    if report.errors:
+        raise typer.Exit(code=1)
+    if report.drifting:
+        raise typer.Exit(code=3)
+
+
 def _database_url(url: str | None) -> str:
     from decision_gate.config import Settings
 
