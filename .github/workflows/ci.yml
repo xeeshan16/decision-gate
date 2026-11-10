@@ -235,16 +235,18 @@ jobs:
       - name: Outcomes through a real Kafka broker, with a dead-lettered bad event
         run: |
           docker compose --profile kafka up -d kafka outcomes-consumer
-          id=$(curl -sf -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
-            -d '{"question": "ticket.queue", "input": {"subject": "kafka smoke"}}' | jq -r .id)
           kafka() { docker compose exec -T kafka "/opt/kafka/bin/$@"; }
-          event="{\"decision_id\": \"$id\", \"outcome\": \"billing\", \"source\": \"kafka\"}"
-          # The broker takes a few seconds to accept writes after it starts.
+          # The broker takes a few seconds to accept requests after it starts.
           for _ in $(seq 1 30); do
-            echo "$event" | timeout 30 kafka kafka-console-producer.sh \
-              --bootstrap-server kafka:9092 --topic dgate.outcomes && break
+            kafka kafka-topics.sh --bootstrap-server kafka:9092 --list > /dev/null && break
             sleep 2
           done
+          id=$(curl -sf -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
+            -d '{"question": "ticket.queue", "input": {"subject": "kafka smoke"}}' | jq -r .id)
+          test -n "$id" && test "$id" != null
+          event="{\"decision_id\": \"$id\", \"outcome\": \"billing\", \"source\": \"kafka\"}"
+          echo "$event" | kafka kafka-console-producer.sh \
+            --bootstrap-server kafka:9092 --topic dgate.outcomes
           echo 'not json' | kafka kafka-console-producer.sh \
             --bootstrap-server kafka:9092 --topic dgate.outcomes
           for _ in $(seq 1 60); do
@@ -258,7 +260,7 @@ jobs:
 
       - name: Logs on failure
         if: failure()
-        run: docker compose --profile kafka logs --no-color
+        run: docker compose --profile kafka logs --no-color migrate api worker outcomes-consumer
 
       - name: Stop the stack
         if: always()
