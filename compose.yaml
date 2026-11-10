@@ -1,0 +1,108 @@
+# decision-gate: the API, the maintenance worker and PostgreSQL.
+#
+#   docker compose up --build                     # API on http://localhost:8080
+#   docker compose --profile kafka up --build     # plus Kafka and the outcome consumer
+#   docker compose --profile otel up --build      # plus an OpenTelemetry collector
+#
+# Everything uses the fake backend and the example catalog and routing, so it runs with no
+# API keys. Point DGATE_BACKEND at "http" or "llm_json" (see README) for a real model.
+
+x-dgate: &dgate
+  build: .
+  image: decision-gate:local
+  environment: &dgate-env
+    DGATE_DATABASE_URL: postgresql+asyncpg://dgate:dgate@postgres:5432/dgate
+    DGATE_BACKEND: ${DGATE_BACKEND:-fake}
+    DGATE_LOG_LEVEL: ${DGATE_LOG_LEVEL:-info}
+    DGATE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    DGATE_DRIFT_WEBHOOK_URL: ${DGATE_DRIFT_WEBHOOK_URL:-}
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: dgate
+      POSTGRES_PASSWORD: dgate  # local demo only; use a secret in any shared deployment
+      POSTGRES_DB: dgate
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dgate -d dgate"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: bring the schema to the latest revision, then exit.
+  migrate:
+    <<: *dgate
+    command: ["dgate", "db", "upgrade"]
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *dgate
+    ports:
+      - "${DGATE_PORT:-8080}:8080"
+    environment:
+      <<: *dgate-env
+      DGATE_ROUTING_CACHE_TTL_S: "5"
+      DGATE_OTEL_ENABLED: ${DGATE_OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Refit, routing refresh and drift checks on a timer. Run one replica; extra replicas
+  # are safe (a PostgreSQL advisory lock lets one run each pass) but do nothing useful.
+  worker:
+    <<: *dgate
+    command: ["sh", "-c", "exec dgate worker --interval ${DGATE_WORKER_INTERVAL_S:-300}"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  kafka:
+    profiles: ["kafka"]
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  # Reads outcome events from dgate.outcomes; rejects go to dgate.outcomes.dlq.
+  outcomes-consumer:
+    <<: *dgate
+    profiles: ["kafka"]
+    command: ["dgate", "outcomes", "consume"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_started
+
+  otel-collector:
+    profiles: ["otel"]
+    image: otel/opentelemetry-collector:0.120.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+
+volumes:
+  pgdata:

@@ -195,3 +195,71 @@ jobs:
           verdict=0
           .venv/bin/dgate shadow compare ticket.queue || verdict=$?
           test "$verdict" = 4
+
+  stack:
+    name: compose stack end to end
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install test dependencies
+        run: uv sync --locked --all-extras
+
+      - name: Validate the Compose file and every profile
+        run: |
+          docker compose config -q
+          docker compose --profile kafka --profile otel config -q
+
+      - name: Build and start API, worker and PostgreSQL
+        env:
+          DGATE_WORKER_INTERVAL_S: "5"
+        run: docker compose up -d --build
+
+      - name: End-to-end test against the stack
+        env:
+          DGATE_E2E_URL: http://localhost:8080
+        run: uv run pytest tests/e2e -v -p no:cacheprovider
+
+      - name: The worker ran passes and the image runs as a non-root user
+        run: |
+          docker compose logs worker | grep -q '"errors":0'
+          test "$(docker compose exec -T api id -u)" = 10001
+
+      - name: Outcomes through a real Kafka broker, with a dead-lettered bad event
+        run: |
+          docker compose --profile kafka up -d kafka outcomes-consumer
+          id=$(curl -sf -X POST localhost:8080/v1/decide -H 'content-type: application/json' \
+            -d '{"question": "ticket.queue", "input": {"subject": "kafka smoke"}}' | jq -r .id)
+          kafka() { docker compose exec -T kafka "/opt/kafka/bin/$@"; }
+          event="{\"decision_id\": \"$id\", \"outcome\": \"billing\", \"source\": \"kafka\"}"
+          # The broker takes a few seconds to accept writes after it starts.
+          for _ in $(seq 1 30); do
+            echo "$event" | timeout 30 kafka kafka-console-producer.sh \
+              --bootstrap-server kafka:9092 --topic dgate.outcomes && break
+            sleep 2
+          done
+          echo 'not json' | kafka kafka-console-producer.sh \
+            --bootstrap-server kafka:9092 --topic dgate.outcomes
+          for _ in $(seq 1 60); do
+            curl -sf "localhost:8080/v1/decisions/$id" | jq -e '.outcome.source == "kafka"' && break
+            sleep 2
+          done
+          curl -sf "localhost:8080/v1/decisions/$id" | jq -e '.outcome.outcome == "billing"'
+          kafka kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+            --topic dgate.outcomes.dlq --from-beginning --max-messages 1 --timeout-ms 60000 \
+            | grep -q 'not json'
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile kafka logs --no-color
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose --profile kafka down -v

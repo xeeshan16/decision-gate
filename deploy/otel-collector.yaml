@@ -1,0 +1,21 @@
+# Receives the API's traces over OTLP/HTTP and prints them (docker compose logs otel-collector).
+# Swap the debug exporter for Jaeger, Tempo or a vendor exporter in a real deployment.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
