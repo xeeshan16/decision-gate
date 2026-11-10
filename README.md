@@ -15,7 +15,7 @@ probability is actually worth, and routes each new decision to one of three tier
 - **verify**: act, but sample for review;
 - **human**: send to a review queue.
 
-> **Status:** under active development (day 11 of a 14-day build). See
+> **Status:** under active development (day 13 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log. Sections below marked *planned* do not exist yet.
 
@@ -51,7 +51,7 @@ statistical bounds, and tighten automatically when calibration drifts.
 | Shadow mode: a candidate backend answers live traffic in the background (or replays stored decisions); both are calibrated identically and compared on the same labeled decisions with McNemar's exact test and auto-tier coverage under the routing policy, for a `promote` / `keep` / `insufficient` verdict | ✅ day 10 |
 | Simulator: synthetic refund and ticket traffic with known truth, segment-dependent miscalibration and injected drift, run through the real service, review queue, refit, routing refresh and drift monitor on a simulated clock; reports the auto tier's true error rate before and after drift (text, Markdown, JSON) | ✅ day 11 |
 | Observability and resilience: Prometheus `/metrics`, OpenTelemetry traces (optional OTLP export), a circuit breaker on the backend that answers `503` with `fallback_tier: human`, and per-caller rate limits on `/v1/decide` | ✅ day 12 |
-| Docker Compose stack and end-to-end test | planned (day 13) |
+| Maintenance worker (refit, routing refresh, drift checks in that order, on a timer; a PostgreSQL advisory lock keeps replicas from overlapping), SVG reliability diagrams, a Docker Compose stack (API, worker, PostgreSQL, optional Kafka and OpenTelemetry collector) with an end-to-end test in CI, and a [statistics write-up](docs/STATISTICS.md) | ✅ day 13 |
 
 ## Architecture
 
@@ -1118,6 +1118,56 @@ to limit `POST /v1/decide` per caller with a token bucket; excess requests get `
 and the breaker are per replica, in memory: with N replicas the overall limit is N times
 the setting, and a shared limit belongs in the gateway.
 
+### Maintenance worker
+
+Refits, routing refreshes and drift checks can each be run by hand (CLI or HTTP), but in
+production they have to happen on their own and in the right order. `dgate worker` runs a
+pass every `--interval` seconds:
+
+1. **refit** every question version (a fit is activated only if it wins on held-out data);
+2. **refresh routing** for every routed question, so thresholds are selected on the newest
+   calibrator;
+3. **check drift** for every monitored question, last, so a tightening lands on the rule
+   just stored instead of being replaced by a refresh later in the same pass.
+
+A failure in one question's step is logged and recorded, and the pass carries on with the
+rest. On PostgreSQL each pass takes a session advisory lock (`pg_try_advisory_lock`), so
+extra replicas skip a pass instead of running it twice. SIGTERM finishes the pass in
+progress before stopping. Each pass prints one JSON line; `--once` runs a single pass and
+exits `1` if a step failed or `3` if a question is drifting, for a cron job or a
+Kubernetes CronJob.
+
+Real output from the end-to-end flow (600 labeled `refund.eligible` decisions, nothing
+labeled for the ticket questions yet), one step per line and details shortened:
+
+```text
+refit   refund.eligible@v1          activated     temperature held-out log loss 0.4677 beats raw 0.5011
+refit   ticket.queue@v1             skipped       0 labeled decisions, fewer than min_count=100
+refit   ticket.handling_minutes@v1  skipped       0 labeled decisions, fewer than min_count=100
+routing refund.eligible@v1          refreshed     auto 0.8976, verify 0.5690: scores from calibrator v1 (temperature); ...
+routing ticket.queue@v1             refreshed     auto none, verify none: no active calibrator; every decision goes to a human ...
+routing ticket.handling_minutes@v1  refreshed     auto none, verify none: no active calibrator; ...
+drift   refund.eligible@v1          ok            action none
+drift   ticket.queue@v1             insufficient  action none
+drift   ticket.handling_minutes@v1  insufficient  action none
+```
+
+### Reliability diagrams
+
+`dgate calibration diagram DIR` writes one SVG per question version: raw confidence and,
+when one is active, the calibrated confidence, with the number of decisions in each bin
+underneath. No plotting library is involved and the output is deterministic, so diagrams
+can be committed and diffed. `dgate simulate run --diagrams DIR` draws one per question and
+phase, scored with the calibrator that was active at each decision. From the committed
+seed-7 simulation, `ticket.queue` before and after drift:
+
+| steady | drift |
+| --- | --- |
+| ![ticket.queue, steady phase](docs/reports/diagrams/ticket.queue-steady.svg) | ![ticket.queue, drift phase](docs/reports/diagrams/ticket.queue-drift.svg) |
+
+[docs/STATISTICS.md](docs/STATISTICS.md) explains every statistical method in the project,
+what each one guarantees and where each guarantee stops.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -1153,6 +1203,31 @@ the setting, and a shared limit belongs in the gateway.
 | `GET /v1/shadow/decisions/{id}` | Every candidate's answer to one decision |
 | `POST /v1/shadow/replay` | Run the configured candidate over stored decisions it has not answered (`{"question", "limit"?, "labeled_only"?}`). `409` when shadow mode is not configured |
 | `GET /v1/shadow/compare` | Paired comparison and verdict for one question (`?question=`, `?candidate=`, `?mode=live\|replay`, `?since=`, `?until=`, `?holdout=`, `?method=`, `?min_paired=`, `?alpha=`, `?min_coverage_gain=`, `?max_failure_rate=`). `422` for invalid options |
+
+## Run the whole stack (Docker Compose)
+
+```bash
+docker compose up --build            # API on http://localhost:8080, worker, PostgreSQL
+```
+
+| Service | What it does |
+| --- | --- |
+| `postgres` | PostgreSQL 17 with a named volume |
+| `migrate` | Runs `dgate db upgrade` once, then exits; everything else waits for it |
+| `api` | `dgate serve` (fake backend, example catalog and routing), as a non-root user |
+| `worker` | `dgate worker`: refit, routing refresh and drift checks every `DGATE_WORKER_INTERVAL_S` seconds (default 300) |
+| `kafka`, `outcomes-consumer` | Profile `kafka`: a single-node KRaft broker and `dgate outcomes consume` |
+| `otel-collector` | Profile `otel`: receives the API's traces (set `DGATE_OTEL_ENABLED=true`) and logs them |
+
+```bash
+docker compose --profile kafka up --build                       # add Kafka outcome ingestion
+DGATE_OTEL_ENABLED=true docker compose --profile otel up --build  # add tracing
+```
+
+The image is a two-stage build: the locked dependencies are resolved with uv in the first
+stage, and the runtime stage holds only the virtual environment and the example
+configuration. CI builds it and runs the stack on every push (see
+[Development](#development)).
 
 ## Backends
 
@@ -1258,7 +1333,16 @@ a refresh over HTTP stores a current rule for every question, the review queue r
 and drift checks over HTTP and the CLI (too little data, so every signal is
 `insufficient` and routing is untouched), plus `/metrics` counting a decision and its replay. A short simulation runs against its own
 PostgreSQL database and its JSON report is checked. The Kafka
-source is tested with in-memory consumer and producer fakes; a test against a real broker comes with the Docker Compose stack (day 13).
+source is unit-tested with in-memory consumer and producer fakes.
+
+A second CI job builds the image and starts the Compose stack, then runs
+[tests/e2e/test_stack.py](tests/e2e/test_stack.py) against it: 600 decisions all go to a
+person, their outcomes arrive in batches, the worker fits a calibrator and stores a
+routing rule on its own timer, and new decisions start to be automated, with the
+calibrated confidence of every automated one at or above the rule's threshold. The same
+job sends an outcome through a real Kafka broker to the consumer and checks that a
+malformed event lands on the dead-letter topic. The end-to-end test runs against any stack
+(`DGATE_E2E_URL=http://localhost:8080 uv run pytest tests/e2e`) and is skipped otherwise.
 
 ## License
 

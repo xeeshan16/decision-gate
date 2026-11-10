@@ -764,3 +764,75 @@ and a local PostgreSQL 16 server: 764 passing, 100% line and branch coverage.
 checks in the safe order, PostgreSQL, optional Kafka and an OTel collector),
 an end-to-end test against the stack, reliability-diagram reports and a statistics
 write-up.
+
+## Day 13 (2026-11-10): worker, Compose stack, end-to-end test, reliability diagrams
+
+**Done**
+
+- `worker.py` and `dgate worker`: one pass refits every question version, refreshes routing
+  for every routed question, then runs drift checks for every monitored one. The order is
+  deliberate: thresholds are selected on the calibrator the refit just activated, and a
+  drift tightening lands on the rule just stored instead of being replaced by a refresh
+  later in the same pass (the refresher also keeps tightening in force). A failure in one
+  question's step is recorded as an `error` step and the pass carries on. One JSON line per
+  pass; `--once` exits `1` on a failed step and `3` on drift. SIGINT/SIGTERM finish the pass
+  in progress before stopping.
+- On PostgreSQL each pass holds a session advisory lock (`pg_try_advisory_lock`, released
+  after the pass, with the implicit transaction committed so the connection does not sit
+  idle in a transaction), so extra worker replicas skip instead of doubling the work.
+  SQLite needs no lock.
+- `reliability.py`: reliability diagrams as standalone, deterministic SVG (no plotting
+  dependency): one line per series, the ECE and count in the legend, and a strip with the
+  number of decisions per bin. `dgate calibration diagram DIR` draws raw vs. the active
+  calibrator per question version from the database; `dgate simulate run --diagrams DIR`
+  draws each question and phase from a simulation, scored with the calibrator active at
+  each decision. The seed-7 diagrams are committed under `docs/reports/diagrams`; their ECE
+  values match the committed simulation report, and re-running the simulation reproduced
+  that report exactly.
+- `Dockerfile` (two stages: uv resolves the locked dependencies with all extras, the
+  runtime stage holds only the virtual environment and the example configuration, runs as
+  uid 10001, with a health check) and `.dockerignore`.
+- `compose.yaml`: `postgres`, a one-shot `migrate`, `api` and `worker` by default; profile
+  `kafka` adds a single-node KRaft broker and `dgate outcomes consume`; profile `otel` adds
+  an OpenTelemetry collector (`deploy/otel-collector.yaml`) that logs the API's traces.
+- `tests/e2e/test_stack.py`, skipped unless `DGATE_E2E_URL` is set: 600 decisions all go to
+  a person, outcomes arrive through the batch endpoint, the worker activates a calibrator
+  and stores a current routing rule on its own, and new decisions start to be automated,
+  each at or above the rule's auto threshold; it also checks drift checks ran and
+  `/metrics` counted automated decisions.
+- CI: a new `stack` job validates the Compose file with every profile, builds the image,
+  starts the stack with a 5-second worker interval, runs the end-to-end test, checks the
+  worker logged passes without errors and that the API runs as uid 10001, then starts the
+  Kafka profile, sends an outcome event through the broker (checked on the decision) and a
+  malformed one (checked on the dead-letter topic).
+- `docs/STATISTICS.md`: every statistical method in the project, what it guarantees, its
+  assumptions, what the seed-7 simulation shows, and what is not guaranteed.
+
+**Verification and its limits.** Docker Hub is not reachable from the environment this
+was built in, so the image and the Compose stack were verified in CI, not locally. Locally:
+the Dockerfile's `uv sync` steps were run as written into a clean directory, and the
+resulting production virtual environment migrated a fresh PostgreSQL 16 database and ran a
+worker pass; the end-to-end test passed against a local API and worker (`--interval 5`) on
+PostgreSQL 16, in about 10 seconds. `docker compose config` passes for every profile.
+
+**Design decision: the worker is a separate process, not a background task in the API.**
+With several API replicas, an in-process scheduler would run every pass N times, and a
+slow refit would compete with request handling. A separate process scales to one replica
+on its own, and the advisory lock makes an accidental second replica harmless.
+
+**Honest gaps**
+
+- Every routing refresh stores a new rule row, so a short worker interval grows the rule
+  history quickly; the default interval is 300 s in Compose and 900 s on the CLI.
+- The worker has no metrics endpoint of its own yet; its JSON lines are the record.
+- The OpenTelemetry profile is validated as configuration only; no test reads the
+  collector's output.
+
+**Tests:** 20 new (step order and content on SQLite and PostgreSQL, error isolation, a held
+lock skipping the pass, the real advisory lock between two engines on PostgreSQL, the loop
+and its stop event, CLI exit codes, SVG structure, escaping and determinism, both diagram
+commands). Ruff, mypy (strict) and the full suite pass locally on Python 3.13 against
+SQLite and PostgreSQL 16.
+
+**Next (day 14):** finish: README polish, setup verified from a clean clone, real output
+throughout, and "What I'd do next".

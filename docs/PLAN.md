@@ -17,7 +17,7 @@ plan changes, this file is updated and the reason is logged in [PROGRESS.md](PRO
 | 10 | **Shadow mode.** Run a candidate backend or prompt version in shadow and compare calibrated performance before promoting it. | done |
 | 11 | **Simulator.** Synthetic ticket-triage and refund-eligibility datasets with known ground truth and deliberately injected miscalibration and drift. `dgate simulate` produces real reports. | done |
 | 12 | **Observability and resilience.** Prometheus metrics, OpenTelemetry, backend timeouts and a circuit breaker that falls back to the human tier, plus rate limits. The fallback is a `fallback_tier: human` signal on the failure response rather than a stored decision without an answer (see PROGRESS, day 12). | done |
-| 13 | **Docker Compose and end-to-end test.** API, worker, Postgres and optional Kafka. Reliability-diagram reports and a statistics write-up. | |
+| 13 | **Docker Compose and end-to-end test.** API, worker, Postgres and optional Kafka. Reliability-diagram reports and a statistics write-up. Added: an optional OpenTelemetry collector profile, and a real-broker Kafka check in CI. | done |
 | 14 | **Finish.** README polish, Mermaid diagram, real output, setup verified from a clean clone, and "What I'd do next". | |
 
 ## Ground rules
