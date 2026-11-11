@@ -836,3 +836,59 @@ SQLite and PostgreSQL 16.
 
 **Next (day 14):** finish: README polish, setup verified from a clean clone, real output
 throughout, and "What I'd do next".
+
+## Day 14 (2026-11-11): finish
+
+**Done**
+
+- `README.md` rewritten for a first-time reader (about 400 lines instead of 1,350): the
+  problem, the seed-7 simulation results with their confidence intervals and the
+  `ticket.queue` reliability diagrams, a "How it works" section with two Mermaid diagrams
+  (the component flowchart and the sequence of one `/v1/decide` call) and the background
+  loop, a feature list, a quick start whose every command and output was produced from a
+  fresh clone today, the Compose stack, backends, a documentation index, the project
+  layout, CI, and "What I'd do next".
+- `docs/GUIDE.md`: the per-component walkthroughs that used to make up most of the README
+  (outcomes through reliability diagrams), with a table of contents and links rewritten
+  for the new location. Sentences written while the project was being built ("that comes
+  with the routing tiers on day 7", "detecting it is day 9") now link to the section that
+  does it.
+- `docs/REFERENCE.md`: the endpoint table, every `DGATE_*` setting and the question
+  catalog format.
+- A script checked every relative link and `#anchor` in `README.md` and `docs/*.md`.
+
+**Verified from a clean clone** (Python 3.13, PostgreSQL 16, no Docker in this
+environment)
+
+- `uv sync`, then the quick start's CLI commands: output identical to the README.
+- `uv run mypy` after a plain `uv sync` reports a missing import for the optional OTLP
+  exporter; CI installs `--all-extras`. The README's development section now says
+  `uv sync --all-extras` and why.
+- Ruff, mypy (strict) and the suite: 628 passed, 158 skipped on SQLite alone; 784 passed,
+  2 skipped with `DGATE_TEST_DATABASE_URL` on PostgreSQL 16.
+- The API quick start against PostgreSQL: migrations, `/readyz`, and a first decision
+  routed to `human` with the reason "not calibrated yet" (the output now in the README).
+- A 14 + 7 + 7-day simulation on SQLite in about 1.5 minutes; its first lines are in the
+  README.
+- The end-to-end test against a local API and worker (`--interval 5`).
+
+**Fix: a race in the end-to-end test.** Its first local run today failed: the worker ran a
+pass while the outcome batches were still arriving, selected thresholds on part of the
+labels, found no auto threshold that met the target with 95% confidence, and stored a
+current rule without one. The test took the first current rule and asserted it had an auto
+threshold. In CI the timing had always fallen the other way. Every worker pass refreshes
+the rule, so the test now waits for a current rule with an auto threshold; it passed on
+two further runs against fresh databases.
+
+**Found while writing "What I'd do next".** The floor a drift check puts on the auto
+threshold applies only while the calibrator is the one it was set under. In the short
+simulation, a refit on day 28 activated a new calibrator during open drift, the refresh
+then selected an auto threshold of 0.4192, and the drift check in the same pass raised it
+to 0.9851. No decision is routed between those steps in the simulator, but in a deployment
+the API could pick up the looser rule between them. Recorded as the second next step rather
+than changed on the last day.
+
+**Not verified here:** the Docker image and Compose stack (Docker Hub is not reachable
+from this environment); CI builds and runs them on every push.
+
+**Next steps:** see "What I'd do next" in the README.
