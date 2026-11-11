@@ -102,14 +102,20 @@ def test_the_worker_turns_labels_into_automation(api: httpx.Client) -> None:
 
     calibrator = _until("an active calibrator", calibrated)
 
+    # A pass can run while the batches are still arriving and select on part of the labels,
+    # which may not be enough to automate anything; every pass refreshes the rule, so wait
+    # for one selected with an auto threshold.
     def current_rule() -> dict[str, Any] | None:
         for s in api.get("/v1/routing/status").json()["questions"]:
-            if s["question"] == QUESTION and s["state"] == "current":
+            if (
+                s["question"] == QUESTION
+                and s["state"] == "current"
+                and s["rule"]["auto_threshold"] is not None
+            ):
                 return dict(s["rule"])
         return None
 
-    rule = _until("a routing rule on the new calibrator", current_rule)
-    assert rule["auto_threshold"] is not None, rule["reason"]
+    rule = _until("a current routing rule with an auto threshold", current_rule)
 
     # 4. New decisions are routed by that rule; the API picks it up after its cache TTL.
     def automated() -> list[dict[str, Any]] | None:
